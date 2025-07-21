@@ -9,7 +9,6 @@ from typing import AsyncIterable, Iterable, Literal
 import boto3
 import numpy as np
 import requests
-import tiktoken
 from botocore.config import Config
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
@@ -45,6 +44,7 @@ from api.setting import (
     DEFAULT_MODEL,
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
+    ENABLE_TIKTOKEN_DECODING,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,16 @@ SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     # "amazon.titan-embed-image-v1": "Titan Multimodal Embeddings G1"
 }
 
-ENCODER = tiktoken.get_encoding("cl100k_base")
+# Conditional tiktoken import and initialization
+ENCODER = None
+if ENABLE_TIKTOKEN_DECODING:
+    try:
+        import tiktoken
+        ENCODER = tiktoken.get_encoding("cl100k_base")
+        logger.info("tiktoken encoder initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize tiktoken encoder: {e}")
+        ENCODER = None
 
 
 def list_bedrock_models() -> dict:
@@ -926,6 +935,14 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
         elif isinstance(embeddings_request.input, Iterable):
             # For encoded input
             # The workaround is to use tiktoken to decode to get the original text.
+            if ENCODER is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Encoded input is not supported when tiktoken decoding is disabled. "
+                           "Set ENABLE_TIKTOKEN_DECODING=true to support encoded inputs, "
+                           "or provide text input directly."
+                )
+            
             encodings = []
             for inner in embeddings_request.input:
                 if isinstance(inner, int):

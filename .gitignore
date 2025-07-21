@@ -161,3 +161,9 @@ cython_debug/
 
 Config
 .vscode/launch.json
+
+# macOS
+.DS_Store
+
+# Deployment artifacts (environment-specific)
+src/task-definition.json
