@@ -89,16 +89,21 @@ SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     # "amazon.titan-embed-image-v1": "Titan Multimodal Embeddings G1"
 }
 
-# Conditional tiktoken import and initialization
+# Lazy tiktoken initialization
 ENCODER = None
-if ENABLE_TIKTOKEN_DECODING:
-    try:
-        import tiktoken
-        ENCODER = tiktoken.get_encoding("cl100k_base")
-        logger.info("tiktoken encoder initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize tiktoken encoder: {e}")
-        ENCODER = None
+
+def _get_tiktoken_encoder():
+    """Lazy initialization of tiktoken encoder - only imports when actually needed"""
+    global ENCODER
+    if ENCODER is None and ENABLE_TIKTOKEN_DECODING:
+        try:
+            import tiktoken  # Import only when needed, not at module level
+            ENCODER = tiktoken.get_encoding("cl100k_base")
+            logger.info("tiktoken encoder initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize tiktoken encoder: {e}")
+            ENCODER = False  # Use False to indicate failed initialization
+    return ENCODER if ENCODER is not False else None
 
 
 def list_bedrock_models() -> dict:
@@ -935,7 +940,8 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
         elif isinstance(embeddings_request.input, Iterable):
             # For encoded input
             # The workaround is to use tiktoken to decode to get the original text.
-            if ENCODER is None:
+            encoder = _get_tiktoken_encoder()
+            if encoder is None:
                 raise HTTPException(
                     status_code=400,
                     detail="Encoded input is not supported when tiktoken decoding is disabled. "
@@ -950,10 +956,10 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
                     encodings.append(inner)
                 else:
                     # Iterable[Iterable[int]]
-                    text = ENCODER.decode(list(inner))
+                    text = encoder.decode(list(inner))
                     texts.append(text)
             if encodings:
-                texts.append(ENCODER.decode(encodings))
+                texts.append(encoder.decode(encodings))
 
         # Maximum of 2048 characters
         args = {
