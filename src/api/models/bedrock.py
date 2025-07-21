@@ -13,6 +13,10 @@ from botocore.config import Config
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
+# Early import logging to catch any issues
+logger = logging.getLogger(__name__)
+logger.info("🟢 BEDROCK.PY: Starting imports - EARLY INSTRUMENTATION CHECK")
+
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.schema import (
     AssistantMessage,
@@ -89,21 +93,40 @@ SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     # "amazon.titan-embed-image-v1": "Titan Multimodal Embeddings G1"
 }
 
-# Lazy tiktoken initialization
+# Lazy tiktoken initialization with comprehensive logging
 ENCODER = None
+
+logger.info("🚀 BEDROCK.PY MODULE LOADING - Starting module import")
+logger.info(f"🔒 ENABLE_TIKTOKEN_DECODING = {ENABLE_TIKTOKEN_DECODING}")
+logger.info("📅 CODE VERSION: LAZY_TIKTOKEN_V2_WITH_INSTRUMENTATION_2025_07_21")
+logger.info("✅ BEDROCK.PY MODULE LOADED - tiktoken import deferred successfully")
+
+# If you see this in logs, the new code is deployed correctly
+logger.info("🎯 VERIFICATION: This message proves lazy tiktoken code is active")
 
 def _get_tiktoken_encoder():
     """Lazy initialization of tiktoken encoder - only imports when actually needed"""
     global ENCODER
+    logger.info(f"🔍 _get_tiktoken_encoder() called - ENCODER={ENCODER}, ENABLE_TIKTOKEN_DECODING={ENABLE_TIKTOKEN_DECODING}")
+    
     if ENCODER is None and ENABLE_TIKTOKEN_DECODING:
+        logger.info("📥 Attempting lazy tiktoken import...")
         try:
             import tiktoken  # Import only when needed, not at module level
+            logger.info("📦 tiktoken imported successfully, getting encoding...")
             ENCODER = tiktoken.get_encoding("cl100k_base")
-            logger.info("tiktoken encoder initialized successfully")
+            logger.info("✅ tiktoken encoder initialized successfully")
         except Exception as e:
-            logger.warning(f"Failed to initialize tiktoken encoder: {e}")
+            logger.error(f"❌ Failed to initialize tiktoken encoder: {e}")
             ENCODER = False  # Use False to indicate failed initialization
-    return ENCODER if ENCODER is not False else None
+    elif ENCODER is None:
+        logger.info("🚫 tiktoken decoding disabled, skipping initialization")
+    else:
+        logger.info(f"♻️ Using cached tiktoken encoder: {type(ENCODER)}")
+    
+    result = ENCODER if ENCODER is not False else None
+    logger.info(f"🔄 _get_tiktoken_encoder() returning: {type(result)}")
+    return result
 
 
 def list_bedrock_models() -> dict:
