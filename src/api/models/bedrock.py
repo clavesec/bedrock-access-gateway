@@ -183,20 +183,36 @@ def list_bedrock_models() -> dict:
     return model_list
 
 
-# Initialize the model list.
-bedrock_model_list = list_bedrock_models()
+# Initialize the model list lazily
+bedrock_model_list = {}
 
 
 class BedrockModel(BaseChatModel):
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
         global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
+        try:
+            bedrock_model_list = list_bedrock_models()
+        except Exception as e:
+            logger.error(f"Failed to list bedrock models: {e}")
+            # Fallback to default model if AWS calls fail
+            if not bedrock_model_list:
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
         return list(bedrock_model_list.keys())
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
         error = ""
+        # Ensure model list is initialized
+        global bedrock_model_list
+        if not bedrock_model_list:
+            try:
+                bedrock_model_list = list_bedrock_models()
+            except Exception as e:
+                logger.warning(f"Failed to list bedrock models during validation: {e}")
+                # Fallback to default model
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
+        
         # check if model is supported
         if chat_request.model not in bedrock_model_list.keys():
             error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
@@ -818,6 +834,16 @@ class BedrockModel(BaseChatModel):
 
     @staticmethod
     def is_supported_modality(model_id: str, modality: str = "IMAGE") -> bool:
+        global bedrock_model_list
+        # Ensure model list is initialized
+        if not bedrock_model_list:
+            try:
+                bedrock_model_list = list_bedrock_models()
+            except Exception as e:
+                logger.warning(f"Failed to list bedrock models for modality check: {e}")
+                # Fallback to default model
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
+        
         model = bedrock_model_list.get(model_id, {})
         modalities = model.get("modalities", [])
         if modality in modalities:

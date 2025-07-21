@@ -21,7 +21,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+logger = logging.getLogger(__name__)
+logger.info("Starting Bedrock Gateway application...")
+
 app = FastAPI(**config)
+
+logger.info("FastAPI application initialized successfully")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,6 +42,10 @@ app.include_router(model.router, prefix=API_ROUTE_PREFIX)
 app.include_router(chat.router, prefix=API_ROUTE_PREFIX)
 app.include_router(embeddings.router, prefix=API_ROUTE_PREFIX)
 
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Application startup complete - ready to serve requests")
 
 @app.get("/health")
 async def health():
@@ -61,4 +71,5 @@ async def validation_exception_handler(request, exc):
 handler = Mangum(app)
 
 if __name__ == "__main__":
+    logger.info("Starting uvicorn server on 0.0.0.0:8000...")
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
