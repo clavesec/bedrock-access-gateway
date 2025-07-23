@@ -13,6 +13,10 @@ from botocore.config import Config
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
+# Early import logging to catch any issues
+logger = logging.getLogger(__name__)
+logger.info("🟢 BEDROCK.PY: Starting imports - EARLY INSTRUMENTATION CHECK")
+
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.schema import (
     AssistantMessage,
@@ -89,16 +93,40 @@ SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     # "amazon.titan-embed-image-v1": "Titan Multimodal Embeddings G1"
 }
 
-# Conditional tiktoken import and initialization
+# Lazy tiktoken initialization with comprehensive logging
 ENCODER = None
-if ENABLE_TIKTOKEN_DECODING:
-    try:
-        import tiktoken
-        ENCODER = tiktoken.get_encoding("cl100k_base")
-        logger.info("tiktoken encoder initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize tiktoken encoder: {e}")
-        ENCODER = None
+
+logger.info("🚀 BEDROCK.PY MODULE LOADING - Starting module import")
+logger.info(f"🔒 ENABLE_TIKTOKEN_DECODING = {ENABLE_TIKTOKEN_DECODING}")
+logger.info("📅 CODE VERSION: LAZY_TIKTOKEN_V2_WITH_INSTRUMENTATION_2025_07_21")
+logger.info("✅ BEDROCK.PY MODULE LOADED - tiktoken import deferred successfully")
+
+# If you see this in logs, the new code is deployed correctly
+logger.info("🎯 VERIFICATION: This message proves lazy tiktoken code is active")
+
+def _get_tiktoken_encoder():
+    """Lazy initialization of tiktoken encoder - only imports when actually needed"""
+    global ENCODER
+    logger.info(f"🔍 _get_tiktoken_encoder() called - ENCODER={ENCODER}, ENABLE_TIKTOKEN_DECODING={ENABLE_TIKTOKEN_DECODING}")
+    
+    if ENCODER is None and ENABLE_TIKTOKEN_DECODING:
+        logger.info("📥 Attempting lazy tiktoken import...")
+        try:
+            import tiktoken  # Import only when needed, not at module level
+            logger.info("📦 tiktoken imported successfully, getting encoding...")
+            ENCODER = tiktoken.get_encoding("cl100k_base")
+            logger.info("✅ tiktoken encoder initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize tiktoken encoder: {e}")
+            ENCODER = False  # Use False to indicate failed initialization
+    elif ENCODER is None:
+        logger.info("🚫 tiktoken decoding disabled, skipping initialization")
+    else:
+        logger.info(f"♻️ Using cached tiktoken encoder: {type(ENCODER)}")
+    
+    result = ENCODER if ENCODER is not False else None
+    logger.info(f"🔄 _get_tiktoken_encoder() returning: {type(result)}")
+    return result
 
 
 def list_bedrock_models() -> dict:
@@ -178,20 +206,36 @@ def list_bedrock_models() -> dict:
     return model_list
 
 
-# Initialize the model list.
-bedrock_model_list = list_bedrock_models()
+# Initialize the model list lazily
+bedrock_model_list = {}
 
 
 class BedrockModel(BaseChatModel):
     def list_models(self) -> list[str]:
         """Always refresh the latest model list"""
         global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
+        try:
+            bedrock_model_list = list_bedrock_models()
+        except Exception as e:
+            logger.error(f"Failed to list bedrock models: {e}")
+            # Fallback to default model if AWS calls fail
+            if not bedrock_model_list:
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
         return list(bedrock_model_list.keys())
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
         error = ""
+        # Ensure model list is initialized
+        global bedrock_model_list
+        if not bedrock_model_list:
+            try:
+                bedrock_model_list = list_bedrock_models()
+            except Exception as e:
+                logger.warning(f"Failed to list bedrock models during validation: {e}")
+                # Fallback to default model
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
+        
         # check if model is supported
         if chat_request.model not in bedrock_model_list.keys():
             error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
@@ -817,6 +861,16 @@ class BedrockModel(BaseChatModel):
 
     @staticmethod
     def is_supported_modality(model_id: str, modality: str = "IMAGE") -> bool:
+        global bedrock_model_list
+        # Ensure model list is initialized
+        if not bedrock_model_list:
+            try:
+                bedrock_model_list = list_bedrock_models()
+            except Exception as e:
+                logger.warning(f"Failed to list bedrock models for modality check: {e}")
+                # Fallback to default model
+                bedrock_model_list = {DEFAULT_MODEL: {"modalities": ["TEXT", "IMAGE"]}}
+        
         model = bedrock_model_list.get(model_id, {})
         modalities = model.get("modalities", [])
         if modality in modalities:
@@ -939,7 +993,8 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
         elif isinstance(embeddings_request.input, Iterable):
             # For encoded input
             # The workaround is to use tiktoken to decode to get the original text.
-            if ENCODER is None:
+            encoder = _get_tiktoken_encoder()
+            if encoder is None:
                 raise HTTPException(
                     status_code=400,
                     detail="Encoded input is not supported when tiktoken decoding is disabled. "
@@ -954,10 +1009,10 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
                     encodings.append(inner)
                 else:
                     # Iterable[Iterable[int]]
-                    text = ENCODER.decode(list(inner))
+                    text = encoder.decode(list(inner))
                     texts.append(text)
             if encodings:
-                texts.append(ENCODER.decode(encodings))
+                texts.append(encoder.decode(encodings))
 
         # Maximum of 2048 characters
         args = {
