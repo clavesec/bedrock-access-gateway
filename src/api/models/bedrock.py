@@ -565,10 +565,12 @@ class BedrockModel(BaseChatModel):
 
         # Base inference parameters.
         inference_config = {
-            "temperature": chat_request.temperature,
             "maxTokens": chat_request.max_tokens,
-            "topP": chat_request.top_p,
         }
+        if chat_request.temperature is not None:
+            inference_config["temperature"] = chat_request.temperature
+        if chat_request.top_p is not None:
+            inference_config["topP"] = chat_request.top_p
 
         if chat_request.stop is not None:
             stop = chat_request.stop
@@ -596,11 +598,17 @@ class BedrockModel(BaseChatModel):
             )
             inference_config["maxTokens"] = max_tokens
             # unset topP - Not supported
-            inference_config.pop("topP")
+            inference_config.pop("topP", None)
 
             args["additionalModelRequestFields"] = {
                 "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
             }
+
+        # Anthropic models reject requests with both temperature and top_p.
+        # Drop top_p, keeping temperature as the primary sampling control.
+        if "anthropic" in chat_request.model.lower():
+            inference_config.pop("topP", None)
+
         # add tool config
         if chat_request.tools:
             tool_config = {"tools": [self._convert_tool_spec(t.function) for t in chat_request.tools]}
