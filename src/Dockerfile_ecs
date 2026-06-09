@@ -6,11 +6,14 @@ COPY ./requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
 
-# Install curl for reliable health checks (removes Python interpreter startup overhead)
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# curl: reliable health checks without Python interpreter startup overhead
+# openssl: startup self-signed certificate for the TLS listener (TPAI HIPAA M1.2)
+RUN apt-get update && apt-get install -y curl openssl && rm -rf /var/lib/apt/lists/*
 
 COPY ./api /app/api
+COPY ./entrypoint_tls.sh /app/entrypoint_tls.sh
+RUN chmod +x /app/entrypoint_tls.sh
 
-ENV PORT=80
+ENV PORT=443
 
-CMD ["sh", "-c", "uvicorn api.app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["/app/entrypoint_tls.sh"]
