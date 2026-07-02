@@ -5,6 +5,7 @@ from fastapi import APIRouter, Body, Depends
 from fastapi.responses import StreamingResponse
 
 from api.auth import api_key_auth
+from api.identity import require_identity
 from api.models.bedrock import BedrockModel
 from api.schema import ChatRequest, ChatResponse, ChatStreamResponse, Error
 from api.setting import DEFAULT_MODEL
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/chat",
-    dependencies=[Depends(api_key_auth)],
+    dependencies=[Depends(api_key_auth), Depends(require_identity)],
     # responses={404: {"description": "Not found"}},
 )
 
