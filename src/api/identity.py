@@ -39,6 +39,21 @@ OWUI_EMAIL_HEADER = "X-OpenWebUI-User-Email"
 API_PROXY_USER_HEADER = "X-TPAI-ApiKey-User"
 
 IDENTITY_HMAC_KEY = os.environ.get("TPAI_IDENTITY_HMAC_KEY", "")
+IDENTITY_ENFORCE = os.environ.get("TPAI_IDENTITY_ENFORCE", "false").lower() == "true"
+
+
+def _require_key_when_enforced(enforce: bool, key: str) -> None:
+    """Fail closed: a deployment that declares enforcement but lost the key
+    (bad task revision, secret-injection failure, drifted CDK) must crash at
+    startup rather than boot healthy with the identity control silently off."""
+    if enforce and not key:
+        raise RuntimeError(
+            "TPAI_IDENTITY_ENFORCE is set but TPAI_IDENTITY_HMAC_KEY is missing - "
+            "refusing to start with identity enforcement silently disabled"
+        )
+
+
+_require_key_when_enforced(IDENTITY_ENFORCE, IDENTITY_HMAC_KEY)
 
 if IDENTITY_HMAC_KEY:
     logger.info("TPAI identity enforcement ENABLED (identity HMAC key configured)")
@@ -65,10 +80,13 @@ async def require_identity(request: Request) -> str | None:
     """
     if not IDENTITY_HMAC_KEY:
         # Pre-flip (or rolled-back) deployment: no key, no enforcement.
+        # Still set the attribute so downstream consumers can read it
+        # unconditionally in every enforcement state.
+        request.state.tpai_identity = None
         return None
 
-    email = (request.headers.get(OWUI_EMAIL_HEADER) or "").strip()
-    api_user = (request.headers.get(API_PROXY_USER_HEADER) or "").strip()
+    email = (request.headers.get(OWUI_EMAIL_HEADER) or "").strip().lower()
+    api_user = (request.headers.get(API_PROXY_USER_HEADER) or "").strip().lower()
 
     if email and api_user:
         raise HTTPException(
@@ -77,9 +95,9 @@ async def require_identity(request: Request) -> str | None:
         )
 
     if email:
-        identity = _identity_hmac("owui-email", email.lower())
+        identity = _identity_hmac("owui-email", email)
     elif api_user:
-        identity = _identity_hmac("api-key-user", api_user.lower())
+        identity = _identity_hmac("api-key-user", api_user)
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

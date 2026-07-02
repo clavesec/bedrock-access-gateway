@@ -7,9 +7,11 @@ Environment must be configured before ``api.*`` modules import: both
 import os
 
 # Exercise the same env-var paths production uses (ECS container secrets
-# inject API_KEY and TPAI_IDENTITY_HMAC_KEY as plain env vars).
-os.environ.setdefault("API_KEY", "test-gateway-api-key")
-os.environ.setdefault("TPAI_IDENTITY_HMAC_KEY", "test-identity-hmac-key")
+# inject API_KEY and TPAI_IDENTITY_HMAC_KEY as plain env vars). Hard-assign
+# (not setdefault) so a developer's exported real credentials can never
+# leak into — or silently redefine — the test fixtures.
+os.environ["API_KEY"] = "test-gateway-api-key"
+os.environ["TPAI_IDENTITY_HMAC_KEY"] = "test-identity-hmac-key"
 os.environ.setdefault("AWS_REGION", "us-east-1")
 # Hermetic tests: never inherit the developer's AWS profile/credentials —
 # api.models.bedrock creates boto3 clients at import time, which resolves

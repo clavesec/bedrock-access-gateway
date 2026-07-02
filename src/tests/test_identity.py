@@ -150,6 +150,28 @@ def test_no_key_disables_enforcement(client, monkeypatch):
     assert resp.status_code == 200
 
 
+def test_disabled_enforcement_still_sets_request_state(monkeypatch):
+    """Downstream audit/budget consumers read request.state.tpai_identity
+    unconditionally — it must exist (as None) in the disabled state too."""
+    monkeypatch.setattr(identity, "IDENTITY_HMAC_KEY", "")
+    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
+    assert result is None
+    assert request.state.tpai_identity is None
+
+
+def test_enforce_flag_without_key_refuses_startup():
+    """Fail closed (TPAI_IDENTITY_ENFORCE): a deployment that declares
+    enforcement but lost the HMAC key must crash, not boot fail-open."""
+    import pytest
+
+    with pytest.raises(RuntimeError, match="TPAI_IDENTITY_ENFORCE"):
+        identity._require_key_when_enforced(True, "")
+    # All other combinations start normally.
+    identity._require_key_when_enforced(True, "some-key")
+    identity._require_key_when_enforced(False, "")
+    identity._require_key_when_enforced(False, "some-key")
+
+
 # --- The raw email never appears in logs (plan.md Phase A verification) --------
 
 
