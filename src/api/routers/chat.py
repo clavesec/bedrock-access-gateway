@@ -1,10 +1,10 @@
 import time
-from typing import Annotated, AsyncIterable
+from typing import Annotated, AsyncIterable, Callable
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from api.access_log import emit_chat_access_log
+from api.access_log import emit_access_log
 from api.auth import api_key_auth
 from api.identity import require_identity
 from api.models.bedrock import BedrockModel
@@ -21,30 +21,29 @@ router = APIRouter(
 async def _stream_with_access_log(
     model: BedrockModel,
     chat_request: ChatRequest,
-    identity: str | None,
-    started: float,
+    emit: Callable[..., None],
 ) -> AsyncIterable[bytes]:
     """Pass the stream through untouched; emit the metadata line at the end.
 
     ``chat_stream`` converts internal errors into an SSE error event on a
-    wire-status-200 response, recording ``stream_error`` on the model — the
-    outcome field reflects that even though the HTTP status cannot.
+    wire-status-200 response, recording ``stream_error`` on the model — so
+    outcome, not status, reflects streaming failures. A client disconnect
+    surfaces as GeneratorExit and is recorded as ``aborted``.
     """
+    outcome = "success"
     try:
         async for chunk in model.chat_stream(chat_request):
             yield chunk
+    except GeneratorExit:
+        outcome = "aborted"
+        raise
+    except BaseException:
+        outcome = "error"
+        raise
     finally:
-        usage = getattr(model, "stream_usage", None)
-        emit_chat_access_log(
-            identity=identity,
-            model=chat_request.model,
-            stream=True,
-            status=200,
-            latency_ms=int((time.monotonic() - started) * 1000),
-            prompt_tokens=usage.prompt_tokens if usage else None,
-            completion_tokens=usage.completion_tokens if usage else None,
-            outcome="error" if getattr(model, "stream_error", False) else "success",
-        )
+        if model.stream_error:
+            outcome = "error"
+        emit(stream=True, status=200, outcome=outcome, usage=model.stream_usage)
 
 
 @router.post(
@@ -73,38 +72,36 @@ async def chat_completions(
     if chat_request.model.lower().startswith("gpt-"):
         chat_request.model = DEFAULT_MODEL
 
-    model = BedrockModel()
+    def emit(*, stream: bool, status: int, outcome: str, usage=None) -> None:
+        emit_access_log(
+            event="chat_completion",
+            identity=identity,
+            model=chat_request.model,
+            stream=stream,
+            status=status,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            prompt_tokens=usage.prompt_tokens if usage else None,
+            completion_tokens=usage.completion_tokens if usage else None,
+            outcome=outcome,
+        )
+
     try:
+        model = BedrockModel()
         # Exception will be raised if model not supported.
         model.validate(chat_request)
         if chat_request.stream:
             return StreamingResponse(
-                content=_stream_with_access_log(model, chat_request, identity, started),
+                content=_stream_with_access_log(model, chat_request, emit),
                 media_type="text/event-stream",
             )
         response = await model.chat(chat_request)
     except Exception as exc:
-        emit_chat_access_log(
-            identity=identity,
-            model=chat_request.model,
-            stream=chat_request.stream,
+        emit(
+            stream=bool(chat_request.stream),
             status=exc.status_code if isinstance(exc, HTTPException) else 500,
-            latency_ms=int((time.monotonic() - started) * 1000),
-            prompt_tokens=None,
-            completion_tokens=None,
             outcome="error",
         )
         raise
 
-    usage = response.usage
-    emit_chat_access_log(
-        identity=identity,
-        model=chat_request.model,
-        stream=False,
-        status=200,
-        latency_ms=int((time.monotonic() - started) * 1000),
-        prompt_tokens=usage.prompt_tokens if usage else None,
-        completion_tokens=usage.completion_tokens if usage else None,
-        outcome="success",
-    )
+    emit(stream=False, status=200, outcome="success", usage=response.usage)
     return response

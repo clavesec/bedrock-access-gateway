@@ -6,12 +6,15 @@ Two properties, both required by ADR-1 condition 2:
    appears in any log record, on any path (non-stream, stream, error), and
    the deleted DIAG marker is gone from the source tree (drift guard).
 2. **The always-on metadata line exists** — exactly one structured JSON
-   line per chat completion carrying status, latency, token counts, tool,
+   line per completed request carrying status, latency, token counts, tool,
    outcome, and the pseudonymous HMAC identity.
+
+The behavioral log-capture tests are the primary guard; the source-scan
+drift guards below are a belt-and-braces backstop, not the acceptance
+property itself.
 """
 
-import hashlib
-import hmac
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -19,13 +22,11 @@ from pathlib import Path
 from fastapi import HTTPException
 
 import api.identity as identity
-from tests.conftest import AUTH, CHAT_BODY, StubBedrockModel
+from api.routers.chat import _stream_with_access_log
+from tests.conftest import AUTH, CHAT_BODY, StubBedrockModel, expected_hmac
 
-TEST_KEY = "test-identity-hmac-key"
 TEST_EMAIL = "alice@example.com"
-EXPECTED_IDENTITY = hmac.new(
-    TEST_KEY.encode(), f"owui-email:{TEST_EMAIL}".encode(), hashlib.sha256
-).hexdigest()
+EXPECTED_IDENTITY = expected_hmac("owui-email", TEST_EMAIL)
 IDENTITY_HEADERS = {**AUTH, identity.OWUI_EMAIL_HEADER: TEST_EMAIL}
 
 # Sentinel content that must never surface in a log record.
@@ -103,6 +104,27 @@ def test_error_path_emits_metadata_line(client, caplog, monkeypatch):
     assert lines[0]["prompt_tokens"] is None
 
 
+def test_error_path_stream_field_is_bool(client, caplog, monkeypatch):
+    """ChatRequest.stream is `bool | None`; the error path must coerce None
+    to False so the line's stream field never drifts from the schema."""
+    caplog.set_level(logging.DEBUG)
+
+    async def broken(self, chat_request):
+        raise HTTPException(status_code=500, detail="boom")
+
+    monkeypatch.setattr(StubBedrockModel, "chat", broken)
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json={**CHAT_BODY, "stream": None},
+        headers=IDENTITY_HEADERS,
+    )
+    assert resp.status_code == 500
+
+    lines = access_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["stream"] is False
+
+
 def test_stream_error_recorded_in_outcome(client, caplog, monkeypatch):
     """chat_stream converts internal failures into an SSE error event on a
     wire-status-200 response; the metadata line still says outcome=error."""
@@ -126,6 +148,27 @@ def test_stream_error_recorded_in_outcome(client, caplog, monkeypatch):
     assert lines[0]["outcome"] == "error"
 
 
+def test_client_disconnect_recorded_as_aborted():
+    """A client dropping mid-stream closes the generator (GeneratorExit);
+    the line must say aborted, not success."""
+    emitted = []
+
+    async def scenario():
+        model = StubBedrockModel()
+        gen = _stream_with_access_log(
+            model,
+            type("Req", (), {"model": "m"})(),
+            lambda **kw: emitted.append(kw),
+        )
+        await anext(gen)  # first chunk delivered, then the client vanishes
+        await gen.aclose()
+
+    asyncio.run(scenario())
+    assert len(emitted) == 1
+    assert emitted[0]["outcome"] == "aborted"
+    assert emitted[0]["status"] == 200
+
+
 def test_metadata_line_emitted_when_enforcement_disabled(client, caplog, monkeypatch):
     """Pre-flip / rolled-back deployments still get the line, identity=null."""
     caplog.set_level(logging.DEBUG)
@@ -138,6 +181,32 @@ def test_metadata_line_emitted_when_enforcement_disabled(client, caplog, monkeyp
     assert lines[0]["identity"] is None
 
 
+def test_embeddings_emits_metadata_line(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    resp = client.post(
+        "/api/v1/embeddings",
+        json={"model": "cohere.embed-multilingual-v3", "input": ["hi"]},
+        headers=IDENTITY_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    lines = access_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert isinstance(line.pop("latency_ms"), int)
+    assert line == {
+        "event": "embeddings",
+        "identity": EXPECTED_IDENTITY,
+        "model": "cohere.embed-multilingual-v3",
+        "stream": None,
+        "status": 200,
+        "prompt_tokens": 3,
+        "completion_tokens": None,
+        "tool": None,
+        "outcome": "success",
+    }
+
+
 # --- No content in logs, ever (the E3 acceptance property) ---------------------
 
 
@@ -147,6 +216,7 @@ def assert_no_content_logged(caplog, resp_content: str = "Hello."):
         assert SENTINEL not in rendered, (
             f"request content leaked into log record from {record.name}:{record.lineno}"
         )
+        # Also catch truncated leaks that drop the head of the sentinel.
         assert "John Doe" not in rendered
         assert resp_content not in rendered, (
             f"response content leaked into log record from {record.name}:{record.lineno}"
@@ -187,18 +257,20 @@ def test_no_content_in_logs_on_error_path(client, caplog, monkeypatch):
 
 
 # --- Drift guards ---------------------------------------------------------------
+#
+# Backstops only: the behavioral tests above are the acceptance property.
 
 DIAG_MARKER = "TPAI-" + "DIAG"  # split so this file never matches itself
+
+
+def source_files(root: Path):
+    return (p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
 
 
 def test_no_diag_markers_in_source():
     """The DIAG-line deletion is permanent — nothing may reintroduce the marker."""
     src_root = Path(__file__).resolve().parents[1]
-    offenders = [
-        str(path)
-        for path in src_root.rglob("*.py")
-        if "__pycache__" not in path.parts and DIAG_MARKER in path.read_text()
-    ]
+    offenders = [str(p) for p in source_files(src_root) if DIAG_MARKER in p.read_text()]
     assert offenders == []
 
 
@@ -208,9 +280,7 @@ def test_no_body_dump_logging_in_source():
     logger.info under DEBUG."""
     src_root = Path(__file__).resolve().parents[1] / "api"
     offenders = []
-    for path in src_root.rglob("*.py"):
-        if "__pycache__" in path.parts:
-            continue
+    for path in source_files(src_root):
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
             if "logger." in line and (
                 "model_dump_json" in line

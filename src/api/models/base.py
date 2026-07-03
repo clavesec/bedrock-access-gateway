@@ -24,6 +24,13 @@ class BaseChatModel(ABC):
     Currently, only Bedrock model is supported, but may be used for SageMaker models if needed.
     """
 
+    # Streaming metadata contract, read by the access log once the stream
+    # ends: chat_stream implementations must set stream_usage when the
+    # provider reports token usage, and stream_error when they swallow a
+    # failure into an in-band SSE error event.
+    stream_usage = None
+    stream_error = False
+
     def list_models(self) -> list[str]:
         """Return a list of supported models"""
         return []
