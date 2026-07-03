@@ -21,7 +21,7 @@ import api.taint as taint
 from tests.conftest import expected_hmac
 from tests.ddb_fake import FakeDynamoDB
 
-IDENTITY = expected_hmac("owui-email", "alice@example.com")
+IDENTITY = expected_hmac("owui-user-id", "a" * 64)
 API_IDENTITY = expected_hmac("api-key-user", "svc-key-7")
 CHAT_SCOPE = taint.resolve_taint_scope(IDENTITY, "chat-1234")
 SESSION_SCOPE = taint.resolve_taint_scope(API_IDENTITY, None)

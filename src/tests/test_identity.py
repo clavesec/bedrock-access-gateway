@@ -8,6 +8,9 @@ raw-email-never-logged log-capture assertion.
 
 import logging
 
+import pytest
+from fastapi import HTTPException
+
 import api.identity as identity
 from tests.conftest import AUTH, CHAT_BODY, expected_hmac
 
@@ -32,14 +35,27 @@ def test_embeddings_missing_identity_rejected(client):
     assert resp.status_code == 401
 
 
-def test_chat_with_owui_email_accepted(client):
+def test_chat_with_owui_user_id_accepted(client):
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={**AUTH, identity.OWUI_USER_ID_HEADER: "b" * 64},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "Hello."
+
+
+def test_chat_with_email_only_rejected(client):
+    """Email-only requests are anomalous (every supported OWUI sends the
+    User-Id header in the same block) and must fail closed rather than
+    open a second, unlinked identity space (SH1 D7 adjustment)."""
     resp = client.post(
         "/api/v1/chat/completions",
         json=CHAT_BODY,
         headers={**AUTH, identity.OWUI_EMAIL_HEADER: TEST_EMAIL},
     )
-    assert resp.status_code == 200
-    assert resp.json()["choices"][0]["message"]["content"] == "Hello."
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Missing user identity"
 
 
 def test_chat_with_api_proxy_identity_accepted(client):
@@ -79,7 +95,7 @@ def test_identity_still_requires_api_key(client):
         json=CHAT_BODY,
         headers={
             "Authorization": "Bearer wrong-key",
-            identity.OWUI_EMAIL_HEADER: TEST_EMAIL,
+            identity.OWUI_USER_ID_HEADER: "b" * 64,
         },
     )
     assert resp.status_code == 401
@@ -119,11 +135,12 @@ def _resolve(headers: dict[str, str]) -> tuple[str, "Request"]:
     return result, request
 
 
-def test_email_identity_is_domain_separated_hmac():
-    """The resolved identity is HMAC-SHA256('owui-email:' + lowercased email)."""
-    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
-    assert result == expected_hmac("owui-email", TEST_EMAIL.lower())
-    assert request.state.tpai_identity == result
+def test_email_only_resolution_rejected():
+    """The email header is never an identity input (SH1 D7 adjustment):
+    without a User-Id header the dependency raises 401 fail-closed."""
+    with pytest.raises(HTTPException) as exc:
+        _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
+    assert exc.value.status_code == 401
 
 
 def test_api_proxy_identity_uses_distinct_domain():
@@ -168,17 +185,11 @@ def test_enforce_flag_without_key_refuses_startup():
 # --- The raw email never appears in logs (plan.md Phase A verification) --------
 
 
-def test_raw_email_never_logged(client, caplog):
-    """Log-capture proof: a request carrying a raw email produces no log line
-    containing it — the email's only line of existence is the HMAC call."""
-    caplog.set_level(logging.DEBUG)
-    resp = client.post(
-        "/api/v1/chat/completions",
-        json=CHAT_BODY,
-        headers={**AUTH, identity.OWUI_EMAIL_HEADER: TEST_EMAIL},
-    )
-    assert resp.status_code == 200
-
+def _assert_email_never_leaks(caplog, resp=None):
+    """One canonical leak scan for every path a raw email header can take:
+    per-record (with source diagnostics), all case variants, and — when a
+    response is given — the response body too. Strengthen it HERE, not in
+    per-test copies."""
     email_variants = {TEST_EMAIL, TEST_EMAIL.lower(), TEST_EMAIL.upper()}
     for record in caplog.records:
         rendered = record.getMessage()
@@ -186,14 +197,33 @@ def test_raw_email_never_logged(client, caplog):
             assert variant not in rendered, (
                 f"raw email leaked into log record from {record.name}:{record.lineno}"
             )
-    # And it never leaks into the response body either.
-    for variant in email_variants:
-        assert variant not in resp.text
+    if resp is not None:
+        for variant in email_variants:
+            assert variant not in resp.text
+
+
+def test_raw_email_never_logged_on_accept_path(client, caplog):
+    """A served request carrying a raw email header (alongside the User-Id
+    it derives identity from) leaks the email nowhere — it is read for the
+    conflict check and never used."""
+    caplog.set_level(logging.DEBUG)
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={
+            **AUTH,
+            identity.OWUI_EMAIL_HEADER: TEST_EMAIL,
+            identity.OWUI_USER_ID_HEADER: "b" * 64,
+        },
+    )
+    assert resp.status_code == 200
+    _assert_email_never_leaks(caplog, resp)
 
 
 def test_raw_email_never_logged_on_rejection_paths(client, caplog):
     caplog.set_level(logging.DEBUG)
-    client.post(
+    # Conflict rejection (400): OWUI + api-proxy identities together.
+    resp_conflict = client.post(
         "/api/v1/chat/completions",
         json=CHAT_BODY,
         headers={
@@ -202,8 +232,16 @@ def test_raw_email_never_logged_on_rejection_paths(client, caplog):
             identity.API_PROXY_USER_HEADER: "a" * 64,
         },
     )
-    assert TEST_EMAIL not in caplog.text
-    assert TEST_EMAIL.lower() not in caplog.text
+    assert resp_conflict.status_code == 400
+    _assert_email_never_leaks(caplog, resp_conflict)
+    # Missing-identity rejection (401): email-only request.
+    resp_missing = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={**AUTH, identity.OWUI_EMAIL_HEADER: TEST_EMAIL},
+    )
+    assert resp_missing.status_code == 401
+    _assert_email_never_leaks(caplog, resp_missing)
 
 
 # --- Mint-path subject capture (m1 Phase E(i), D8/R12) --------------------------
@@ -218,15 +256,6 @@ def test_owui_identity_captures_session_binding_subject():
     )
     assert request.state.tpai_mint_binding == "owui-session"
     assert request.state.tpai_mint_subject_id == subject
-
-
-def test_owui_identity_without_user_id_header_yields_no_subject():
-    """No User-Id header → no mint subject (api.mint refuses to mint an
-    unbound token). Ingestion itself stays permissive: identity resolves."""
-    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
-    assert result is not None
-    assert request.state.tpai_mint_binding == "owui-session"
-    assert request.state.tpai_mint_subject_id is None
 
 
 def test_api_proxy_identity_captures_api_key_binding_subject():
@@ -259,23 +288,7 @@ def test_disabled_enforcement_sets_mint_state_to_none(monkeypatch):
     assert request.state.tpai_mint_subject_id is None
 
 
-def test_subject_and_identity_derive_from_the_same_user_id():
-    """SH1 D7 adjustment (TPAI#346): the User-Id header is now BOTH the
-    identity-HMAC input and the mint cross-check subject on the primary OWUI
-    path — one immutable key, two derived views. (Inverts the pre-SH1
-    property that the subject never perturbed an email-derived identity;
-    email-derived identity survives only on the User-Id-less fallback.)"""
-    with_subject, request = _resolve(
-        {identity.OWUI_EMAIL_HEADER: TEST_EMAIL, identity.OWUI_USER_ID_HEADER: "b" * 64}
-    )
-    assert with_subject == expected_hmac("owui-user-id", "b" * 64)
-    assert request.state.tpai_mint_subject_id == "b" * 64
-    without_subject, _ = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
-    assert without_subject == expected_hmac("owui-email", TEST_EMAIL.lower())
-    assert with_subject != without_subject
-
-
-# --- User-Id-primary identity (SH1 flag-day fix — TPAI#346, D7 adjustment) -----
+# --- User-Id identity (SH1 flag-day fix — TPAI#346, D7 adjustment) -------------
 
 USER_ID = "d" * 64
 PLACEHOLDER_EMAIL = f"{'d' * 16}@placeholder.tpai.internal"
@@ -293,30 +306,21 @@ def test_user_id_identity_is_domain_separated_hmac():
     assert result != expected_hmac("api-key-user", USER_ID)
 
 
-def test_user_id_takes_precedence_over_email():
-    """When both OWUI headers are present the email is deliberately unused —
-    email is mutable (reconciliation placeholder) and None for
-    billing-enrolled users; the user id is immutable."""
-    result, _ = _resolve(
-        {identity.OWUI_USER_ID_HEADER: USER_ID, identity.OWUI_EMAIL_HEADER: TEST_EMAIL}
-    )
+@pytest.mark.parametrize(
+    "email_header",
+    [None, "", TEST_EMAIL, PLACEHOLDER_EMAIL],
+    ids=["absent", "empty", "real-email", "reconciled-placeholder"],
+)
+def test_identity_derives_from_user_id_regardless_of_email(email_header):
+    """The email header — absent, empty (billing-enrolled users), real, or
+    rewritten by provisioning name-reconciliation — never perturbs the
+    identity. Budget counters and the 7-year audit trail hang off identity
+    stability, and email is a mutable field."""
+    headers = {identity.OWUI_USER_ID_HEADER: USER_ID}
+    if email_header is not None:
+        headers[identity.OWUI_EMAIL_HEADER] = email_header
+    result, _ = _resolve(headers)
     assert result == expected_hmac("owui-user-id", USER_ID)
-
-
-def test_identity_stable_across_email_mutation():
-    """Provisioning name-reconciliation can rewrite a user's email
-    (None -> @placeholder.tpai.internal). The identity must not re-key —
-    budget counters and the 7-year audit trail hang off it."""
-    empty, _ = _resolve(
-        {identity.OWUI_USER_ID_HEADER: USER_ID, identity.OWUI_EMAIL_HEADER: ""}
-    )
-    placeholder, _ = _resolve(
-        {
-            identity.OWUI_USER_ID_HEADER: USER_ID,
-            identity.OWUI_EMAIL_HEADER: PLACEHOLDER_EMAIL,
-        }
-    )
-    assert empty == placeholder == expected_hmac("owui-user-id", USER_ID)
 
 
 def test_billing_enrolled_header_shape_accepted(client):
@@ -355,28 +359,3 @@ def test_user_id_conflicts_with_api_proxy_header(client):
     assert resp.status_code == 400
 
 
-def test_email_only_fallback_still_resolves_email_identity():
-    """Legacy fallback (pre-fix fork / non-fork OWUI): email-only requests
-    keep the original owui-email derivation and carry no mint subject."""
-    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
-    assert result == expected_hmac("owui-email", TEST_EMAIL.lower())
-    assert request.state.tpai_mint_subject_id is None
-
-
-def test_raw_email_never_logged_on_primary_path(client, caplog):
-    """The one-line-of-existence property must hold on the primary path too,
-    where the email header is read but never used."""
-    caplog.set_level(logging.DEBUG)
-    resp = client.post(
-        "/api/v1/chat/completions",
-        json=CHAT_BODY,
-        headers={
-            **AUTH,
-            identity.OWUI_EMAIL_HEADER: TEST_EMAIL,
-            identity.OWUI_USER_ID_HEADER: USER_ID,
-        },
-    )
-    assert resp.status_code == 200
-    for variant in (TEST_EMAIL, TEST_EMAIL.lower(), TEST_EMAIL.upper()):
-        assert variant not in caplog.text
-        assert variant not in resp.text

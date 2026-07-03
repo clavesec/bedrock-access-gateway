@@ -6,28 +6,38 @@ scoping + API-key rotation, not by cryptography):
 
 - OWUI traffic:      ``X-OpenWebUI-User-Id``     (the immutable OWUI user id;
   for billing-enrolled users this is the enrollment pseudonym — no PII).
-  ``X-OpenWebUI-User-Email`` is a legacy fallback only: billing-enrolled
-  users (every real production user) have ``email=None`` — the fork sends
-  an empty email header — and a user's email can mutate later (the
+  Identity keys on the user id, NOT the email (D7 adjustment, ratified by
+  the flag-day owner during SH1 gate-day prep 2026-07-03, TPAI#346):
+  billing-enrolled users — every real production user — have ``email=None``
+  (the fork coalesces the header to ``""``), and emails are mutable (the
   provisioning name-reconciliation writes a ``@placeholder.tpai.internal``
-  address), which would silently re-key an email-derived identity and break
-  budget/audit continuity. Keying on the user id was ratified by the
-  flag-day owner during SH1 gate-day prep (2026-07-03; see TPAI#346
-  discussion) as the D7 adjustment.
+  address), so an email-derived identity would either fail outright or
+  silently re-key mid-history, breaking budget and 7-year-audit continuity.
+  Requests carrying an email header but no user id are REJECTED (401): every
+  supported OWUI (fork or upstream) sends both headers in the same block, so
+  an email-only request is anomalous, and accepting it would open a second,
+  unlinked identity space (fail closed instead).
 - api-proxy traffic: ``X-TPAI-ApiKey-User``      (the ``tpai-api-keys`` per-user
   id, already pseudonymous; the api-proxy strips any inbound identity headers
   before asserting this one)
 
 Identity = HMAC-SHA256 over a domain-separated input, keyed with a dedicated
 Product-account secret (``TPAI_IDENTITY_HMAC_KEY``, decision E2). This key is
-never billing's Services-account HMAC secret — the audit and billing pseudonym
-spaces must stay unlinkable without both keys.
+never billing's Services-account HMAC secret and never leaves the Product
+account. E2 scope note (SH1): because the OWUI user id *is* the enrollment
+pseudonym for billing-enrolled users, a Product-account actor holding this
+key plus any enrollment-keyed table can join audit identities to enrollment
+pseudonyms with this key alone — two-key unlinkability is unachievable for
+email-less users (every input visible to this gateway is Product-visible,
+and the OWUI user row already carries ``billing_customer_id``). What the
+dedicated key still buys: audit identities are opaque without it, and
+Services-side actors cannot map into the audit space at all. Recorded for
+the S09 THREAT_MODEL rewrite.
 
-The raw email (legacy fallback path only) has exactly one line of existence
-in this process: the ``_identity_hmac(...)`` call inside ``require_identity``.
-It must never be logged, stored, or attached to request state — the
-log-capture test in ``tests/test_identity.py`` asserts this. On the primary
-path the email header is read but never used.
+The raw email is never used: the header is read only to detect conflicting
+identity assertions and is never logged, stored, hashed, or attached to
+request state — the log-capture tests in ``tests/test_identity.py`` assert
+this on both the accept and reject paths.
 
 Enforcement is active iff ``TPAI_IDENTITY_HMAC_KEY`` is configured. The E1
 flag-day change-set injects the key via ECS container secrets together with
@@ -53,13 +63,13 @@ from api.mint import BINDING_API_KEY, BINDING_OWUI_SESSION
 
 logger = logging.getLogger(__name__)
 
+# Read only for conflict detection; never an identity input (module docstring).
 OWUI_EMAIL_HEADER = "X-OpenWebUI-User-Email"
-# OWUI's user id — sent by the same upstream header block as the email when
-# ENABLE_FORWARD_USER_INFO_HEADERS is on. For billing-enrolled users this is
-# the enrollment pseudonym (user_id == email_hmac), i.e. the key space of the
-# auth-server's session and api-key tables. It is BOTH the primary identity
-# HMAC input (immutable, unlike email — see module docstring) and the mint
-# path's cross-check subject (api.mint, D8).
+# The OWUI identity header: both the identity-HMAC input and the mint path's
+# cross-check subject (api.mint, D8) — one immutable key, two derived views.
+# For billing-enrolled users this is the enrollment pseudonym
+# (user_id == email_hmac), i.e. the key space of the auth-server's session
+# and api-key tables.
 OWUI_USER_ID_HEADER = "X-OpenWebUI-User-Id"
 API_PROXY_USER_HEADER = "X-TPAI-ApiKey-User"
 
@@ -117,7 +127,9 @@ async def require_identity(request: Request) -> str | None:
     # HMAC, exactness also guarantees stability (ids are system-generated and
     # never re-cased, unlike emails).
     user_id = (request.headers.get(OWUI_USER_ID_HEADER) or "").strip()
-    email = (request.headers.get(OWUI_EMAIL_HEADER) or "").strip().lower()
+    # Never an identity input — read only so a caller asserting both an OWUI
+    # identity (id or email) and an api-proxy identity is rejected.
+    email = (request.headers.get(OWUI_EMAIL_HEADER) or "").strip()
     api_user = (request.headers.get(API_PROXY_USER_HEADER) or "").strip().lower()
 
     if (user_id or email) and api_user:
@@ -127,21 +139,14 @@ async def require_identity(request: Request) -> str | None:
         )
 
     if user_id:
-        # Primary OWUI path: identity from the immutable user id. The email
-        # header, when present alongside it, is deliberately unused.
+        # OWUI path: identity from the immutable user id. The email header,
+        # when present alongside it, is deliberately unused. Email-only
+        # requests fall through to the 401 below (module docstring).
         identity = _identity_hmac("owui-user-id", user_id)
         # Mint-path subject (D8): the enrollment-space user id, cross-checked
         # by the mint Lambda against active sessions.
         binding = BINDING_OWUI_SESSION
         subject_id = user_id
-    elif email:
-        # Legacy fallback (pre-fix fork, or non-fork OWUI): email-derived
-        # identity. No User-Id header → no mint subject; api.mint refuses to
-        # mint an unbound token (fail closed at mint time — ingestion stays
-        # permissive so non-tool traffic is unaffected).
-        identity = _identity_hmac("owui-email", email)
-        binding = BINDING_OWUI_SESSION
-        subject_id = None
     elif api_user:
         identity = _identity_hmac("api-key-user", api_user)
         # api-proxy callers have no OWUI session: the mint Lambda cross-checks

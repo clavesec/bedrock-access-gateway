@@ -49,9 +49,14 @@ The request deliberately carries **both pseudonym spaces**:
   api-key tables. It never leaves the mint request: not in the JWT, not in
   gateway or Lambda logs.
 
-The pairing of the two spaces exists only in this request and the Lambda's
-memory. Logging them together anywhere would create the linkage E2 exists
-to prevent; `tests/test_mint.py::test_token_and_subject_never_logged`
+E2 scope note (SH1 D7 adjustment, 2026-07-03): for `owui-session` callers
+the identity is now *derived from* the subject
+(`HMAC(owui-user-id, subject_id)` under the Product-account E2 key), so the
+pairing is computable by any Product-account actor holding that key — see
+the scope note in `api.identity` (recorded for the S09 THREAT_MODEL
+rewrite). The hygiene rule stands on its own: the two values are never
+logged together, the JWT and connector side never see the enrollment
+pseudonym; `tests/test_mint.py::test_token_and_subject_never_logged`
 asserts the gateway side, and the Lambda logs only
 `identity.slice(0, 8)` + outcome.
 
