@@ -3,13 +3,14 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends
 
 from api.auth import api_key_auth
+from api.identity import require_identity
 from api.models.bedrock import get_embeddings_model
 from api.schema import EmbeddingsRequest, EmbeddingsResponse
 from api.setting import DEFAULT_EMBEDDING_MODEL
 
 router = APIRouter(
     prefix="/embeddings",
-    dependencies=[Depends(api_key_auth)],
+    dependencies=[Depends(api_key_auth), Depends(require_identity)],
 )
 
 
