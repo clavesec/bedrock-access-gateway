@@ -69,6 +69,14 @@ logger = logging.getLogger(__name__)
 # auth-server stack's tpai-connector-mint-<env> function). Unset means this
 # deployment cannot mint — get_connector_token refuses rather than degrades.
 MINT_FUNCTION_ARN = os.environ.get("TPAI_CONNECTOR_MINT_FUNCTION_ARN", "")
+# The mint interface endpoint's own DNS name (https://vpce-….lambda.….vpce.
+# amazonaws.com). The endpoint deliberately does NOT use private DNS — that
+# would capture every lambda.<region>.amazonaws.com resolution in the VPC
+# (including VPN operators' aws CLI, which the endpoint policy would then
+# deny) — so this client must address the endpoint explicitly. Unset falls
+# back to the default resolver (unroutable in the airgapped VPC → the invoke
+# fails closed, matching the dark posture).
+MINT_ENDPOINT_URL = os.environ.get("TPAI_CONNECTOR_MINT_ENDPOINT_URL", "")
 
 REQUEST_SCHEMA = "tpai.connector-mint.request.v1"
 
@@ -117,7 +125,12 @@ class MintRefusedError(RuntimeError):
 class MintedToken:
     token: str
     expires_at: int  # epoch seconds (the JWT's exp claim)
-    binding: str
+    # The subject the Lambda's live-ness cross-check ran against. A cache hit
+    # requires the presented subject to match — a token verified for subject A
+    # must never be served to a request asserting subject B under the same
+    # identity (possible only in the owui-session binding, e.g. an OWUI
+    # account recreated with the same email inside the TTL window).
+    subject_id: str
 
     def fresh(self, now: float) -> bool:
         return now < self.expires_at - REFRESH_MARGIN_SECONDS
@@ -125,8 +138,8 @@ class MintedToken:
 
 def _lambda():
     """Lazy singleton Lambda client (like api.audit._s3: importing the app
-    never resolves AWS credentials for a dark code path). The default
-    endpoint resolves through the interface endpoint's private DNS."""
+    never resolves AWS credentials for a dark code path). Addressed at the
+    interface endpoint's own DNS name — see MINT_ENDPOINT_URL above."""
     global _lambda_client
     with _lambda_lock:
         if _lambda_client is None:
@@ -134,6 +147,7 @@ def _lambda():
                 "lambda",
                 region_name=os.environ.get("AWS_REGION"),
                 config=_LAMBDA_CONFIG,
+                **({"endpoint_url": MINT_ENDPOINT_URL} if MINT_ENDPOINT_URL else {}),
             )
         return _lambda_client
 
@@ -164,7 +178,7 @@ def _invoke_mint(identity: str, binding: str, subject_id: str) -> MintedToken:
                 f"mint Lambda returned FunctionError={response['FunctionError']}"
             )
         body = json.loads(response["Payload"].read())
-    except (MintError, MintRefusedError):
+    except MintError:
         raise
     except Exception as exc:
         logger.error("connector mint invoke failed (%s)", type(exc).__name__)
@@ -188,7 +202,7 @@ def _invoke_mint(identity: str, binding: str, subject_id: str) -> MintedToken:
         raise MintError("mint Lambda response is missing the token")
     if not isinstance(expires_at, int) or expires_at <= time.time():
         raise MintError("mint Lambda response has a missing or expired expires_at")
-    return MintedToken(token=token, expires_at=expires_at, binding=binding)
+    return MintedToken(token=token, expires_at=expires_at, subject_id=subject_id)
 
 
 def get_connector_token(identity: str, binding: str, subject_id: str | None) -> MintedToken:
@@ -218,7 +232,10 @@ def get_connector_token(identity: str, binding: str, subject_id: str | None) -> 
     now = time.time()
     with _cache_lock:
         cached = _token_cache.get(identity)
-        if cached is not None and cached.fresh(now):
+        if cached is not None and cached.fresh(now) and cached.subject_id == subject_id:
+            # Subject equality guards the owui-session binding: the cached
+            # token's live-session check ran against cached.subject_id, so a
+            # request asserting a different subject re-mints (and re-checks).
             return cached
 
     minted = _invoke_mint(identity, binding, subject_id)

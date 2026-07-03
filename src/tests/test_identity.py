@@ -235,7 +235,17 @@ def test_api_proxy_identity_captures_api_key_binding_subject():
     value = "c" * 64
     _, request = _resolve({identity.API_PROXY_USER_HEADER: value})
     assert request.state.tpai_mint_binding == "api-key"
-    assert request.state.tpai_mint_subject_id == value.lower()
+    assert request.state.tpai_mint_subject_id == value
+
+
+def test_api_key_subject_preserves_case_while_identity_lowercases():
+    """The subject is an exact DynamoDB key in tpai-api-keys: the HMAC's
+    .lower() normalization must not leak into it, or legacy mixed-case
+    userIds could never pass the mint Lambda's live-credential cross-check."""
+    value = "Legacy-User-ABC123"
+    result, request = _resolve({identity.API_PROXY_USER_HEADER: f"  {value} "})
+    assert request.state.tpai_mint_subject_id == value
+    assert result == expected_hmac("api-key-user", value.lower())
 
 
 def test_disabled_enforcement_sets_mint_state_to_none(monkeypatch):

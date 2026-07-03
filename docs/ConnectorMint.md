@@ -26,7 +26,7 @@ property that justified auth-server minting over gateway self-signing:
 | Binding | Subject (`subject_id`) | Cross-check | Property bound |
 |---|---|---|---|
 | `owui-session` | `X-OpenWebUI-User-Id` — the enrollment-space `user_id` (= `email_hmac`) | an unexpired VPN session exists for the subject (`tpai-vpn-sessions`, `user_id-index`) | **live login** |
-| `api-key` | `X-TPAI-ApiKey-User` — the `tpai-api-keys` per-user id | a `tpai-api-keys` record exists for the subject and is not revoked | **live credential** (R12) |
+| `api-key` | `X-TPAI-ApiKey-User` — the `tpai-api-keys` per-user id, **case-preserved** (it is an exact DynamoDB key; only the HMAC input is lowercased) | a `tpai-api-keys` record exists for the subject and is not revoked (any present, non-`false` `revoked` marker counts as revoked — fail closed on marker-type drift) | **live credential** (R12) |
 
 > **Record for the S09 THREAT_MODEL rewrite:** OWUI identities are bound to
 > a *live login* (an active VPN session — walk away, session expires, tools
@@ -71,7 +71,7 @@ Request (Lambda `RequestResponse` payload):
 Success / refusal:
 
 ```json
-{ "ok": true, "token": "<RS256 JWT>", "expires_at": 1751500000, "binding": "owui-session" }
+{ "ok": true, "token": "<RS256 JWT>", "expires_at": 1751500000 }
 { "ok": false, "reason": "no_active_session | unknown_api_key | revoked_api_key | invalid_request" }
 ```
 
@@ -89,8 +89,10 @@ fallback is pinned to — keep them aligned.
 | Malformed identity/binding arguments | `ValueError` | programming bug — fix the call site |
 
 Refusals are never cached; a user can log in and retry immediately.
-Successful tokens are cached per identity until `exp − 30s`
-(`invalidate(identity)` drops one entry, e.g. after a connector 401).
+Successful tokens are cached per identity until `exp − 30s`, and a cache
+hit additionally requires the presented `subject_id` to equal the one the
+token's live-ness check ran against — a changed subject re-mints.
+(`invalidate(identity)` drops one entry, e.g. after a connector 401.)
 
 ## m2 integration (the choke point)
 
@@ -117,4 +119,5 @@ wrap each in `starlette.concurrency.run_in_threadpool`, exactly as
 | Env var | Source | Meaning |
 |---|---|---|
 | `TPAI_CONNECTOR_MINT_FUNCTION_ARN` | bedrock-gateway-stack (deterministic ARN) | unset ⇒ dark; set ⇒ mint path armed (still no call sites until m2) |
-| `AWS_REGION` | task definition | client region; default endpoint resolves through the interface endpoint's private DNS |
+| `TPAI_CONNECTOR_MINT_ENDPOINT_URL` | bedrock-gateway-stack, from the network stack's endpoint DNS output | explicit `https://vpce-…` address of the mint interface endpoint. The endpoint has **no private DNS** (it would capture all in-VPC `lambda.<region>` resolution — including VPN operators' CLI — under its deny-all-but-mint policy), so this client must address it explicitly. Unset ⇒ default resolver ⇒ unroutable in the airgapped VPC ⇒ fail closed |
+| `AWS_REGION` | task definition | client region |

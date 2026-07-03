@@ -45,15 +45,16 @@ def ok_response(expires_in=900):
         "ok": True,
         "token": FAKE_JWT,
         "expires_at": int(time.time()) + expires_in,
-        "binding": "owui-session",
     }
 
 
 @pytest.fixture(autouse=True)
 def configured(monkeypatch):
-    """Point the module at a fake ARN and an empty cache for every test."""
+    """Point the module at a fake ARN and pristine module state for every
+    test (the client singleton too, so no test depends on execution order)."""
     monkeypatch.setattr(mint, "MINT_FUNCTION_ARN", FAKE_ARN)
     monkeypatch.setattr(mint, "_token_cache", {})
+    monkeypatch.setattr(mint, "_lambda_client", None)
     yield
 
 
@@ -145,6 +146,18 @@ def test_invalidate_drops_the_cached_token(monkeypatch):
     mint.invalidate(IDENTITY)
     mint.get_connector_token(IDENTITY, mint.BINDING_OWUI_SESSION, SUBJECT)
     assert len(fake.invocations) == 2
+
+
+def test_changed_subject_bypasses_the_cache(monkeypatch):
+    """A cached token was live-ness-checked against its subject; a request
+    asserting a different subject under the same identity must re-mint (and
+    re-cross-check), never be served the stale binding."""
+    fake = use_fake(monkeypatch, FakeLambda([ok_response(), ok_response()]))
+    mint.get_connector_token(IDENTITY, mint.BINDING_OWUI_SESSION, SUBJECT)
+    other = "f" * 64
+    mint.get_connector_token(IDENTITY, mint.BINDING_OWUI_SESSION, other)
+    assert len(fake.invocations) == 2
+    assert json.loads(fake.invocations[1]["Payload"])["subject_id"] == other
 
 
 # --- Refusals (clean deny) ---------------------------------------------------------

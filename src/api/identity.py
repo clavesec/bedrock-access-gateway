@@ -122,9 +122,12 @@ async def require_identity(request: Request) -> str | None:
         identity = _identity_hmac("api-key-user", api_user)
         # api-proxy callers have no OWUI session: the mint Lambda cross-checks
         # the api-key's validity/revocation instead (R12) — the subject is the
-        # same per-user id the api-proxy asserted.
+        # per-user id the api-proxy asserted, case-preserved: it is an exact
+        # DynamoDB key in tpai-api-keys, so the .lower() normalization applied
+        # to the HMAC input above must NOT leak into it (legacy mixed-case
+        # userIds would never match and the live credential would be refused).
         binding = BINDING_API_KEY
-        subject_id = api_user
+        subject_id = (request.headers.get(API_PROXY_USER_HEADER) or "").strip()
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

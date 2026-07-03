@@ -26,6 +26,7 @@ os.environ.pop("TPAI_BUDGET_TABLE", None)
 # a test that forgets to stub the Lambda client can never invoke a real
 # mint function (fixtures monkeypatch mint.MINT_FUNCTION_ARN explicitly).
 os.environ.pop("TPAI_CONNECTOR_MINT_FUNCTION_ARN", None)
+os.environ.pop("TPAI_CONNECTOR_MINT_ENDPOINT_URL", None)
 # ...and their import-time-parsed config siblings: an inherited override
 # would skew the default-limit assertions, and an empty-string export would
 # crash int() at import — a collection-time error for the whole suite.
