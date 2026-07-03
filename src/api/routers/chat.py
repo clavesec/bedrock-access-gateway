@@ -10,10 +10,11 @@ from api.identity import require_identity
 from api.models.bedrock import BedrockModel
 from api.schema import ChatRequest, ChatResponse, ChatStreamResponse, Error
 from api.setting import DEFAULT_MODEL
+from api.taint import capture_conversation
 
 router = APIRouter(
     prefix="/chat",
-    dependencies=[Depends(api_key_auth), Depends(require_identity)],
+    dependencies=[Depends(api_key_auth), Depends(require_identity), Depends(capture_conversation)],
     # responses={404: {"description": "Not found"}},
 )
 

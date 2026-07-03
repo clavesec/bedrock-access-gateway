@@ -17,8 +17,11 @@ os.environ["API_KEY"] = "test-gateway-api-key"
 os.environ["TPAI_IDENTITY_HMAC_KEY"] = IDENTITY_TEST_KEY
 # api.audit reads TPAI_AUDIT_BUCKET at import time: drop any real value so a
 # test that forgets to stub the S3 client can never PUT to a real audit
-# bucket (fixtures monkeypatch audit.AUDIT_BUCKET explicitly).
+# bucket (fixtures monkeypatch audit.AUDIT_BUCKET explicitly). Same for the
+# taint/budget DynamoDB tables (api.taint / api.budget).
 os.environ.pop("TPAI_AUDIT_BUCKET", None)
+os.environ.pop("TPAI_TAINT_TABLE", None)
+os.environ.pop("TPAI_BUDGET_TABLE", None)
 os.environ.setdefault("AWS_REGION", "us-east-1")
 # Hermetic tests: never inherit the developer's AWS profile/credentials —
 # api.models.bedrock creates boto3 clients at import time, which resolves
