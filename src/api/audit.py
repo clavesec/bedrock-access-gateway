@@ -55,22 +55,26 @@ logger = logging.getLogger(__name__)
 # Injected by the audit-sink CDK wiring (bedrock-gateway-stack). Unset means
 # this deployment cannot audit — emit_audit_record refuses rather than drops.
 AUDIT_BUCKET = os.environ.get("TPAI_AUDIT_BUCKET", "")
-# Key prefix for gateway-side records; the Phase E connector writes its
-# matching records under connector/ in the same bucket.
-AUDIT_PREFIX = os.environ.get("TPAI_AUDIT_PREFIX", "gateway/")
+# Deliberately a constant, NOT an env var: the task role's IAM grant is
+# pinned to exactly this prefix (gateway/*), so any other value turns every
+# put into AccessDenied — and fail-closed turns that into a tool-call
+# outage. Changing the prefix requires a CDK change anyway; keep the two
+# pinned together. (The Phase E connector writes under connector/.)
+AUDIT_PREFIX = "gateway/"
 
 SCHEMA = "tpai.gateway.tool-call.v1"
 
 VALID_POLICY_DECISIONS = ("allow", "deny")
 VALID_OUTCOMES = ("success", "denied", "error", "timeout")
 
-# The audit put sits on the tool-call critical path (fail closed), so keep
-# its worst case bounded: tight timeouts, standard retries — unlike the
-# long-lived streaming config used for Bedrock calls.
+# The audit put sits on the tool-call critical path (fail closed) and each
+# in-flight call pins a threadpool thread, so the worst case must stay small:
+# 2 attempts x (3s connect + 5s read) + backoff ≈ ~17s ceiling for a <1KB
+# put to a same-region gateway endpoint — vs ~50s with boto3's defaults.
 _S3_CONFIG = Config(
-    connect_timeout=5,
-    read_timeout=10,
-    retries={"max_attempts": 3, "mode": "standard"},
+    connect_timeout=3,
+    read_timeout=5,
+    retries={"max_attempts": 2, "mode": "standard"},
 )
 
 _s3_lock = threading.Lock()
@@ -153,6 +157,10 @@ def emit_audit_record(
             Key=key,
             Body=body,
             ContentType="application/json",
+            # Object Lock buckets require a Content-MD5/x-amz-checksum header.
+            # botocore >= 1.36 would add one by default; pass it explicitly so
+            # the invariant doesn't live in a transitive SDK default.
+            ChecksumAlgorithm="CRC32",
         )
     except Exception as exc:
         # Never log record fields here: the full URL belongs only in the

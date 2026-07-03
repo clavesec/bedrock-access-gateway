@@ -66,6 +66,9 @@ def test_synthetic_record_matches_ratified_schema(fake_s3):
     assert call["Bucket"] == "tpai-audit-test-000000000000"
     assert call["Key"] == key
     assert call["ContentType"] == "application/json"
+    # Object Lock buckets require a checksum header; it must be explicit,
+    # not inherited from a botocore-version default.
+    assert call["ChecksumAlgorithm"] == "CRC32"
 
     record = json.loads(call["Body"])
     ts = record.pop("ts")

@@ -51,7 +51,9 @@ s3://tpai-audit-<env>-<account>/
 Date-partitioned for review tooling (Athena/S3 Select); the uuid suffix
 makes concurrent writers collision-free. Object Lock retention is the
 bucket default — the emitter never calls `PutObjectRetention` and the task
-role is not granted it.
+role is not granted it. Puts carry an explicit `ChecksumAlgorithm=CRC32`
+(Object Lock requires a checksum header; do not rely on the botocore
+default).
 
 ## Operating contract
 
@@ -64,7 +66,17 @@ role is not granted it.
   WORM trail; CloudWatch keeps the metadata-only access line (E3, which
   carries the tool *name* only). Failure logs carry the exception class
   and S3 key, never record fields — `test_audit.py` asserts this.
-- **Configuration:** `TPAI_AUDIT_BUCKET` (injected by the CDK wiring),
-  `TPAI_AUDIT_PREFIX` (default `gateway/`).
+- **Configuration:** `TPAI_AUDIT_BUCKET` only (injected by the CDK wiring).
+  The `gateway/` prefix is a code constant, deliberately not configurable:
+  the task role's IAM grant is pinned to exactly `gateway/*`, so any other
+  prefix is an AccessDenied outage. Bounded latency: the S3 client is
+  capped at 2 attempts × (3s connect + 5s read) — worst case ~17s before
+  the tool call fails closed.
+- **m2 wiring requirement:** route every tool execution through a single
+  audited choke point that emits on *all* branches — success, denied,
+  error, and timeout. Per-branch emit calls scattered through the executor
+  is how a branch gets missed and a retrieval happens unaudited; the m3 G4
+  audit-pair review assumes gateway/connector records exist for every
+  fetch.
 - **Dark today:** no server-side tool executes until m2 Phase 0 ships and
   its flag family is enabled; this module has no production call sites yet.
