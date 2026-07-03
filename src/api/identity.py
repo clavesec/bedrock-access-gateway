@@ -20,10 +20,16 @@ logged, stored, or attached to request state — the log-capture test in
 ``tests/test_identity.py`` asserts this.
 
 Enforcement is active iff ``TPAI_IDENTITY_HMAC_KEY`` is configured. The E1
-flag-day change-set injects the key via ECS container secrets; a plain
-CloudFormation rollback removes it and restores pre-flip behavior without
-re-tagging the container image (task definitions reference ``:latest``, so a
-code-level kill switch would otherwise force an image rollback too).
+flag-day change-set injects the key via ECS container secrets together with
+``TPAI_IDENTITY_ENFORCE=true``; a plain CloudFormation rollback removes both
+and restores pre-flip behavior without re-tagging the container image (task
+definitions reference ``:latest``, so a code-level kill switch would
+otherwise force an image rollback too).
+
+CAUTION for live task-definition surgery (the phase4-MFA-style incident
+rollback): removing only the HMAC key while ``TPAI_IDENTITY_ENFORCE`` stays
+``true`` intentionally CRASHES the container at startup (fail closed).
+Disable both together, or roll back the whole template.
 """
 
 import hashlib
