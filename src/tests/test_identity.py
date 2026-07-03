@@ -259,11 +259,124 @@ def test_disabled_enforcement_sets_mint_state_to_none(monkeypatch):
     assert request.state.tpai_mint_subject_id is None
 
 
-def test_subject_id_is_not_part_of_the_identity_hmac():
-    """The User-Id header must not perturb the identity derivation — it is
-    the cross-check subject, not identity input."""
-    with_subject, _ = _resolve(
+def test_subject_and_identity_derive_from_the_same_user_id():
+    """SH1 D7 adjustment (TPAI#346): the User-Id header is now BOTH the
+    identity-HMAC input and the mint cross-check subject on the primary OWUI
+    path — one immutable key, two derived views. (Inverts the pre-SH1
+    property that the subject never perturbed an email-derived identity;
+    email-derived identity survives only on the User-Id-less fallback.)"""
+    with_subject, request = _resolve(
         {identity.OWUI_EMAIL_HEADER: TEST_EMAIL, identity.OWUI_USER_ID_HEADER: "b" * 64}
     )
+    assert with_subject == expected_hmac("owui-user-id", "b" * 64)
+    assert request.state.tpai_mint_subject_id == "b" * 64
     without_subject, _ = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
-    assert with_subject == without_subject
+    assert without_subject == expected_hmac("owui-email", TEST_EMAIL.lower())
+    assert with_subject != without_subject
+
+
+# --- User-Id-primary identity (SH1 flag-day fix — TPAI#346, D7 adjustment) -----
+
+USER_ID = "d" * 64
+PLACEHOLDER_EMAIL = f"{'d' * 16}@placeholder.tpai.internal"
+
+
+def test_user_id_identity_is_domain_separated_hmac():
+    """Primary OWUI path: identity = HMAC-SHA256('owui-user-id:' + user id)."""
+    result, request = _resolve({identity.OWUI_USER_ID_HEADER: USER_ID})
+    assert result == expected_hmac("owui-user-id", USER_ID)
+    assert request.state.tpai_identity == result
+    assert request.state.tpai_mint_binding == "owui-session"
+    assert request.state.tpai_mint_subject_id == USER_ID
+    # Domain separation from both legacy spaces.
+    assert result != expected_hmac("owui-email", USER_ID)
+    assert result != expected_hmac("api-key-user", USER_ID)
+
+
+def test_user_id_takes_precedence_over_email():
+    """When both OWUI headers are present the email is deliberately unused —
+    email is mutable (reconciliation placeholder) and None for
+    billing-enrolled users; the user id is immutable."""
+    result, _ = _resolve(
+        {identity.OWUI_USER_ID_HEADER: USER_ID, identity.OWUI_EMAIL_HEADER: TEST_EMAIL}
+    )
+    assert result == expected_hmac("owui-user-id", USER_ID)
+
+
+def test_identity_stable_across_email_mutation():
+    """Provisioning name-reconciliation can rewrite a user's email
+    (None -> @placeholder.tpai.internal). The identity must not re-key —
+    budget counters and the 7-year audit trail hang off it."""
+    empty, _ = _resolve(
+        {identity.OWUI_USER_ID_HEADER: USER_ID, identity.OWUI_EMAIL_HEADER: ""}
+    )
+    placeholder, _ = _resolve(
+        {
+            identity.OWUI_USER_ID_HEADER: USER_ID,
+            identity.OWUI_EMAIL_HEADER: PLACEHOLDER_EMAIL,
+        }
+    )
+    assert empty == placeholder == expected_hmac("owui-user-id", USER_ID)
+
+
+def test_billing_enrolled_header_shape_accepted(client):
+    """The post-fix fork shape for billing-enrolled users (email=None ->
+    coalesced to an empty header) resolves identity and serves the request."""
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={
+            **AUTH,
+            identity.OWUI_EMAIL_HEADER: "",
+            identity.OWUI_USER_ID_HEADER: USER_ID,
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_user_id_case_and_whitespace_handling():
+    """The user id is an exact session-table key: strip whitespace, preserve
+    case, and feed the exact value to both the HMAC and the mint subject."""
+    result, request = _resolve({identity.OWUI_USER_ID_HEADER: "  MixedCase-Id-01 "})
+    assert request.state.tpai_mint_subject_id == "MixedCase-Id-01"
+    assert result == expected_hmac("owui-user-id", "MixedCase-Id-01")
+
+
+def test_user_id_conflicts_with_api_proxy_header(client):
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={
+            **AUTH,
+            identity.OWUI_USER_ID_HEADER: USER_ID,
+            identity.API_PROXY_USER_HEADER: "a" * 64,
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_email_only_fallback_still_resolves_email_identity():
+    """Legacy fallback (pre-fix fork / non-fork OWUI): email-only requests
+    keep the original owui-email derivation and carry no mint subject."""
+    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
+    assert result == expected_hmac("owui-email", TEST_EMAIL.lower())
+    assert request.state.tpai_mint_subject_id is None
+
+
+def test_raw_email_never_logged_on_primary_path(client, caplog):
+    """The one-line-of-existence property must hold on the primary path too,
+    where the email header is read but never used."""
+    caplog.set_level(logging.DEBUG)
+    resp = client.post(
+        "/api/v1/chat/completions",
+        json=CHAT_BODY,
+        headers={
+            **AUTH,
+            identity.OWUI_EMAIL_HEADER: TEST_EMAIL,
+            identity.OWUI_USER_ID_HEADER: USER_ID,
+        },
+    )
+    assert resp.status_code == 200
+    for variant in (TEST_EMAIL, TEST_EMAIL.lower(), TEST_EMAIL.upper()):
+        assert variant not in caplog.text
+        assert variant not in resp.text
