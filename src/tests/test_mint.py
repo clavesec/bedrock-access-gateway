@@ -14,6 +14,12 @@ import pytest
 
 from api import mint
 
+# Captured at import time, BEFORE any fixture can reset the module global:
+# the autouse `configured` fixture nulls mint._lambda_client per test (order
+# hygiene), which would otherwise make the import-laziness assertion below
+# unfalsifiable.
+_CLIENT_WAS_NONE_AT_IMPORT = mint._lambda_client is None
+
 IDENTITY = "a" * 64
 SUBJECT = "b" * 64
 FAKE_ARN = "arn:aws:lambda:us-east-1:000000000000:function:tpai-connector-mint-test"
@@ -74,8 +80,10 @@ def test_unconfigured_arn_fails_closed(monkeypatch):
 
 def test_importing_the_module_never_builds_a_client():
     """The dark path must not resolve AWS credentials at import (the same
-    lazy-singleton invariant as api.audit / api.ddb)."""
-    assert mint._lambda_client is None
+    lazy-singleton invariant as api.audit / api.ddb). Asserted against the
+    import-time snapshot — the autouse fixture resets the global per test,
+    so checking the live attribute here would always pass."""
+    assert _CLIENT_WAS_NONE_AT_IMPORT
 
 
 # --- Input validation ------------------------------------------------------------
