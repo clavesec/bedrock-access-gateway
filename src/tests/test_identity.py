@@ -204,3 +204,66 @@ def test_raw_email_never_logged_on_rejection_paths(client, caplog):
     )
     assert TEST_EMAIL not in caplog.text
     assert TEST_EMAIL.lower() not in caplog.text
+
+
+# --- Mint-path subject capture (m1 Phase E(i), D8/R12) --------------------------
+
+
+def test_owui_identity_captures_session_binding_subject():
+    """OWUI traffic: the mint subject is the enrollment-space user id from
+    X-OpenWebUI-User-Id, with the owui-session (live login) binding."""
+    subject = "b" * 64
+    _, request = _resolve(
+        {identity.OWUI_EMAIL_HEADER: TEST_EMAIL, identity.OWUI_USER_ID_HEADER: subject}
+    )
+    assert request.state.tpai_mint_binding == "owui-session"
+    assert request.state.tpai_mint_subject_id == subject
+
+
+def test_owui_identity_without_user_id_header_yields_no_subject():
+    """No User-Id header → no mint subject (api.mint refuses to mint an
+    unbound token). Ingestion itself stays permissive: identity resolves."""
+    result, request = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
+    assert result is not None
+    assert request.state.tpai_mint_binding == "owui-session"
+    assert request.state.tpai_mint_subject_id is None
+
+
+def test_api_proxy_identity_captures_api_key_binding_subject():
+    """api-proxy traffic: the asserted per-user key id is the mint subject,
+    with the api-key (live credential, R12) binding."""
+    value = "c" * 64
+    _, request = _resolve({identity.API_PROXY_USER_HEADER: value})
+    assert request.state.tpai_mint_binding == "api-key"
+    assert request.state.tpai_mint_subject_id == value
+
+
+def test_api_key_subject_preserves_case_while_identity_lowercases():
+    """The subject is an exact DynamoDB key in tpai-api-keys: the HMAC's
+    .lower() normalization must not leak into it, or legacy mixed-case
+    userIds could never pass the mint Lambda's live-credential cross-check."""
+    value = "Legacy-User-ABC123"
+    result, request = _resolve({identity.API_PROXY_USER_HEADER: f"  {value} "})
+    assert request.state.tpai_mint_subject_id == value
+    assert result == expected_hmac("api-key-user", value.lower())
+
+
+def test_disabled_enforcement_sets_mint_state_to_none(monkeypatch):
+    """The disabled state must define the mint attributes too, so the m2
+    choke point can read them unconditionally."""
+    monkeypatch.setattr(identity, "IDENTITY_HMAC_KEY", "")
+    _, request = _resolve(
+        {identity.OWUI_EMAIL_HEADER: TEST_EMAIL, identity.OWUI_USER_ID_HEADER: "b" * 64}
+    )
+    assert request.state.tpai_mint_binding is None
+    assert request.state.tpai_mint_subject_id is None
+
+
+def test_subject_id_is_not_part_of_the_identity_hmac():
+    """The User-Id header must not perturb the identity derivation — it is
+    the cross-check subject, not identity input."""
+    with_subject, _ = _resolve(
+        {identity.OWUI_EMAIL_HEADER: TEST_EMAIL, identity.OWUI_USER_ID_HEADER: "b" * 64}
+    )
+    without_subject, _ = _resolve({identity.OWUI_EMAIL_HEADER: TEST_EMAIL})
+    assert with_subject == without_subject

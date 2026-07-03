@@ -39,9 +39,17 @@ import os
 
 from fastapi import HTTPException, Request, status
 
+from api.mint import BINDING_API_KEY, BINDING_OWUI_SESSION
+
 logger = logging.getLogger(__name__)
 
 OWUI_EMAIL_HEADER = "X-OpenWebUI-User-Email"
+# OWUI's user id — sent by the same upstream header block as the email when
+# ENABLE_FORWARD_USER_INFO_HEADERS is on. For billing-enrolled users this is
+# the enrollment pseudonym (user_id == email_hmac), i.e. the key space of the
+# auth-server's session and api-key tables. The mint path (api.mint, D8)
+# needs it as the cross-check subject; it is NOT part of the identity HMAC.
+OWUI_USER_ID_HEADER = "X-OpenWebUI-User-Id"
 API_PROXY_USER_HEADER = "X-TPAI-ApiKey-User"
 
 IDENTITY_HMAC_KEY = os.environ.get("TPAI_IDENTITY_HMAC_KEY", "")
@@ -86,9 +94,11 @@ async def require_identity(request: Request) -> str | None:
     """
     if not IDENTITY_HMAC_KEY:
         # Pre-flip (or rolled-back) deployment: no key, no enforcement.
-        # Still set the attribute so downstream consumers can read it
+        # Still set the attributes so downstream consumers can read them
         # unconditionally in every enforcement state.
         request.state.tpai_identity = None
+        request.state.tpai_mint_binding = None
+        request.state.tpai_mint_subject_id = None
         return None
 
     email = (request.headers.get(OWUI_EMAIL_HEADER) or "").strip().lower()
@@ -102,8 +112,22 @@ async def require_identity(request: Request) -> str | None:
 
     if email:
         identity = _identity_hmac("owui-email", email)
+        # Mint-path subject (D8): the enrollment-space user id, cross-checked
+        # by the mint Lambda against active sessions. Absent header → None;
+        # api.mint refuses to mint an unbound token (fail closed at mint
+        # time — ingestion stays permissive so non-tool traffic is unaffected).
+        binding = BINDING_OWUI_SESSION
+        subject_id = (request.headers.get(OWUI_USER_ID_HEADER) or "").strip() or None
     elif api_user:
         identity = _identity_hmac("api-key-user", api_user)
+        # api-proxy callers have no OWUI session: the mint Lambda cross-checks
+        # the api-key's validity/revocation instead (R12) — the subject is the
+        # per-user id the api-proxy asserted, case-preserved: it is an exact
+        # DynamoDB key in tpai-api-keys, so the .lower() normalization applied
+        # to the HMAC input above must NOT leak into it (legacy mixed-case
+        # userIds would never match and the live credential would be refused).
+        binding = BINDING_API_KEY
+        subject_id = (request.headers.get(API_PROXY_USER_HEADER) or "").strip()
     else:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -111,4 +135,6 @@ async def require_identity(request: Request) -> str | None:
         )
 
     request.state.tpai_identity = identity
+    request.state.tpai_mint_binding = binding
+    request.state.tpai_mint_subject_id = subject_id
     return identity
