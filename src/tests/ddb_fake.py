@@ -40,6 +40,7 @@ class FakeDynamoDB:
         ConditionExpression,
         ExpressionAttributeNames,
         ExpressionAttributeValues,
+        ReturnValuesOnConditionCheckFailure=None,
     ):
         self.calls.append(("update_item", {"TableName": TableName, "Key": Key}))
         if self.fail_with is not None:
@@ -50,21 +51,28 @@ class FakeDynamoDB:
         item = table.get(pk, {})
         vals = ExpressionAttributeValues
 
+        def _conditional_failure(message):
+            exc = ConditionalCheckFailedException(message)
+            # Mirror botocore: with ReturnValuesOnConditionCheckFailure=
+            # ALL_OLD the refused write carries the pre-image on
+            # exc.response["Item"].
+            exc.response = (
+                {"Item": dict(item)} if ReturnValuesOnConditionCheckFailure == "ALL_OLD" else {}
+            )
+            return exc
+
         if ConditionExpression == "attribute_not_exists(tainted_class) OR tainted_class = :cls":
             if "tainted_class" in item and item["tainted_class"]["S"] != vals[":cls"]["S"]:
-                raise ConditionalCheckFailedException("taint class conflict")
+                raise _conditional_failure("taint class conflict")
         elif ConditionExpression == "attribute_not_exists(n) OR n < :limit":
             if "n" in item and int(item["n"]["N"]) >= int(vals[":limit"]["N"]):
-                raise ConditionalCheckFailedException("budget limit reached")
+                raise _conditional_failure("budget limit reached")
         else:
             raise AssertionError(f"unrecognized ConditionExpression: {ConditionExpression!r}")
 
-        if UpdateExpression == (
-            "SET tainted_class = :cls, first_tool = if_not_exists(first_tool, :tool), #ttl = :ttl"
-        ):
+        if UpdateExpression == "SET tainted_class = :cls, #ttl = :ttl":
             item = dict(item)
             item["tainted_class"] = {"S": vals[":cls"]["S"]}
-            item.setdefault("first_tool", {"S": vals[":tool"]["S"]})
             item["ttl"] = {"N": vals[":ttl"]["N"]}
         elif UpdateExpression == "ADD n :one SET #ttl = :ttl":
             item = dict(item)

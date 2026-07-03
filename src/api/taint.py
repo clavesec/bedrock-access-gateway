@@ -14,6 +14,13 @@ never filtered, never recorded):
     inbound-private   gmail_search, gmail_get_message   (m3)
     outbound-fetch    web_fetch                          (m2)
 
+The separation between the two tool worlds is positional, not nominal: the
+m2 executor must build its injection list from the gateway's own registry
+(``TOOL_CLASSES`` keys gated by their feature flags) and must never derive
+it from names appearing in the request — a client tool that happens to be
+named ``web_fetch`` is still a client tool. ``record_tool_use`` backstops
+this: it refuses (ValueError, fail closed) any tool name it cannot classify.
+
 Taint scope (D9, resolved 2026-07-02):
 
 - **Conversation-keyed** via ``X-OpenWebUI-Chat-Id`` (forwarded by the OWUI
@@ -27,11 +34,20 @@ Taint scope (D9, resolved 2026-07-02):
   connector-JWT TTL. Sliding (refreshed on every tool use), not bucketed:
   a fixed time bucket would reset taint mid-burst at the bucket boundary.
 
+Threat model note: scope keys are partly client-asserted (the chat id), so
+an authenticated caller can partition their *own* state across scopes — but
+the attacker the taint rule defends against is **injected content inside
+the conversation**, which cannot set transport headers. A caller malicious
+enough to rotate scope keys can already exfiltrate anything they can read
+using their own code; cross-scope rotation is additionally bounded by the
+user-day budget (api.budget).
+
 State lives in DynamoDB (``TPAI_TAINT_TABLE``), not in process memory —
 multiple gateway tasks run behind the ALB, and taint must be sticky across
 all of them. Items carry a TTL for hygiene; conversation taint is deliberately
-long-lived (``TPAI_TAINT_CONVERSATION_TTL_DAYS``, default 90) because a
-dormant conversation still holds its attacker content when resumed.
+long-lived (``TPAI_TAINT_CONVERSATION_TTL_DAYS``, default 90 — pinned
+explicitly by the CDK env block) because a dormant conversation still holds
+its attacker content when resumed.
 
 Enforcement layers (the m2 Converse loop MUST use both — see
 ``docs/TaintAndBudgets.md`` for the full integration contract):
@@ -49,9 +65,13 @@ Enforcement layers (the m2 Converse loop MUST use both — see
 
 Operating contract (same posture as ``api.audit``):
 
-- **Fail closed.** Store errors — including an unconfigured table — raise
-  ``TaintStoreError``; a classified tool call whose taint state cannot be
-  read or recorded must not execute.
+- **Fail closed.** Store errors — including an unconfigured table or a
+  malformed stored item — raise ``TaintStoreError``; a classified tool call
+  whose taint state cannot be read or recorded must not execute.
+- **Blocking I/O.** These are synchronous boto3 calls; async callers (the
+  m2 Converse loop) must wrap them in
+  ``starlette.concurrency.run_in_threadpool`` the same way ``api.audit``
+  and ``models/bedrock.py`` do.
 - **Dark today.** No server-side tool executes until m2 Phase 0 lands and
   its flag is enabled; nothing calls into the store in production. The
   ``capture_conversation`` dependency (chat-id header capture) is live but
@@ -62,12 +82,11 @@ Operating contract (same posture as ``api.audit``):
 import logging
 import os
 import re
-import threading
 import time
 
-import boto3
-from botocore.config import Config
 from fastapi import Request
+
+from api import ddb
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +97,8 @@ OUTBOUND_FETCH = "outbound-fetch"
 
 # The classification registry for server-side tools. m2/m3 sessions extend
 # this map when they add tools; anything not listed here is a client tool
-# and passes through the gateway untouched.
+# and passes through the gateway untouched. Every class added here MUST get
+# a matching _OPPOSING entry — record_tool_use and filter_tools key on it.
 TOOL_CLASSES = {
     "web_fetch": OUTBOUND_FETCH,
     "gmail_search": INBOUND_PRIVATE,
@@ -106,17 +126,6 @@ CONVERSATION_TAINT_TTL_DAYS = int(os.environ.get("TPAI_TAINT_CONVERSATION_TTL_DA
 # reject anything that could smuggle structure into a DynamoDB key.
 _CHAT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
-# Taint reads/writes sit on the tool-call critical path (fail closed), so
-# the worst case must stay small — same rationale as the audit emitter.
-_DDB_CONFIG = Config(
-    connect_timeout=3,
-    read_timeout=5,
-    retries={"max_attempts": 2, "mode": "standard"},
-)
-
-_ddb_lock = threading.Lock()
-_ddb_client = None
-
 
 class TaintStoreError(RuntimeError):
     """Taint state could not be read or durably recorded. Callers must fail
@@ -124,7 +133,7 @@ class TaintStoreError(RuntimeError):
 
 
 class TaintConflictError(RuntimeError):
-    """The scope is already tainted with the opposing tool class; this tool
+    """The scope is already tainted with a conflicting tool class; this tool
     call is blocked by the trifecta rule (D9)."""
 
     def __init__(self, scope: str, tool: str, tainted_class: str):
@@ -137,17 +146,9 @@ class TaintConflictError(RuntimeError):
 
 
 def _ddb():
-    """Lazy singleton DynamoDB client (importing the app never resolves AWS
-    credentials for a dark code path)."""
-    global _ddb_client
-    with _ddb_lock:
-        if _ddb_client is None:
-            _ddb_client = boto3.client(
-                "dynamodb",
-                region_name=os.environ.get("AWS_REGION"),
-                config=_DDB_CONFIG,
-            )
-        return _ddb_client
+    """Indirection over the shared client so tests can stub this module's
+    store without touching the other consumers."""
+    return ddb.client()
 
 
 def classify_tool(tool_name: str) -> str | None:
@@ -161,7 +162,10 @@ async def capture_conversation(request: Request) -> None:
     ``request.state.tpai_chat_id`` (None when absent or malformed).
 
     Malformed values are treated as absent — the caller then takes the
-    session-keyed taint fallback, which is the stricter scope.
+    session-keyed taint fallback, which is the stricter scope. Consumers
+    outside the /chat router must read this defensively
+    (``getattr(request.state, "tpai_chat_id", None)``); only routes that
+    declare this dependency are guaranteed the attribute.
     """
     raw = (request.headers.get(CHAT_ID_HEADER) or "").strip()
     request.state.tpai_chat_id = raw if _CHAT_ID_RE.match(raw) else None
@@ -182,7 +186,13 @@ def resolve_taint_scope(identity: str, chat_id: str | None) -> str:
     return f"session#{identity}"
 
 
-def _scope_ttl_epoch(scope: str, now: float) -> int:
+def scope_ttl_epoch(scope: str, now: float) -> int:
+    """TTL epoch for state keyed by this scope.
+
+    Public because a scope's lifetime is a property of the scope itself:
+    api.budget derives its scope-counter TTL from here too, so a taint item
+    and its budget counter can never expire on different schedules.
+    """
     if scope.startswith("session#"):
         return int(now) + SESSION_TAINT_TTL_SECONDS
     return int(now) + CONVERSATION_TAINT_TTL_DAYS * 86400
@@ -210,7 +220,23 @@ def get_taint(scope: str) -> str | None:
     item = resp.get("Item")
     if not item:
         return None
-    return item["tainted_class"]["S"]
+    try:
+        return item["tainted_class"]["S"]
+    except (KeyError, TypeError) as exc:
+        # Only reachable via an out-of-band write (the task role can only
+        # GetItem/UpdateItem, and record_tool_use always SETs the class) —
+        # still, unknown state must fail closed, not leak a KeyError.
+        logger.error("malformed taint item for scope (missing tainted_class)")
+        raise TaintStoreError("malformed taint item") from exc
+
+
+def _stored_class_from(exc: Exception) -> str | None:
+    """The pre-existing tainted_class carried on a conditional-check failure
+    (ReturnValuesOnConditionCheckFailure=ALL_OLD), if present."""
+    response = getattr(exc, "response", None) or {}
+    item = response.get("Item") or {}
+    tainted = item.get("tainted_class") or {}
+    return tainted.get("S")
 
 
 def record_tool_use(scope: str, tool_name: str) -> str:
@@ -218,7 +244,7 @@ def record_tool_use(scope: str, tool_name: str) -> str:
 
     Atomic set-or-confirm: succeeds when the scope is untainted or already
     tainted with the same class (refreshing the sliding TTL); raises
-    ``TaintConflictError`` when the opposing class holds the scope. Call
+    ``TaintConflictError`` when a conflicting class holds the scope. Call
     this immediately before executing every classified tool — the
     conditional write, not the advisory filter, is the enforcement point.
     """
@@ -232,23 +258,26 @@ def record_tool_use(scope: str, tool_name: str) -> str:
         raise TaintStoreError(
             "TPAI_TAINT_TABLE is not configured - refusing to execute a classified tool"
         )
-    now = time.time()
     try:
         _ddb().update_item(
             TableName=TAINT_TABLE,
             Key={"pk": {"S": scope}},
-            UpdateExpression="SET tainted_class = :cls, first_tool = if_not_exists(first_tool, :tool), #ttl = :ttl",
+            UpdateExpression="SET tainted_class = :cls, #ttl = :ttl",
             ConditionExpression="attribute_not_exists(tainted_class) OR tainted_class = :cls",
             ExpressionAttributeNames={"#ttl": "ttl"},
             ExpressionAttributeValues={
                 ":cls": {"S": tool_class},
-                ":tool": {"S": tool_name},
-                ":ttl": {"N": str(_scope_ttl_epoch(scope, now))},
+                ":ttl": {"N": str(scope_ttl_epoch(scope, time.time()))},
             },
+            # On refusal, carry the stored item back so the error names the
+            # class that actually holds the scope — never inferred, so it
+            # stays correct if a third tool class ever exists.
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
     except Exception as exc:
-        if type(exc).__name__ == "ConditionalCheckFailedException":
-            raise TaintConflictError(scope, tool_name, _OPPOSING[tool_class])
+        if ddb.is_conditional_check_failure(exc):
+            stored = _stored_class_from(exc) or _OPPOSING[tool_class]
+            raise TaintConflictError(scope, tool_name, stored)
         logger.error("taint write failed (%s)", type(exc).__name__)
         raise TaintStoreError("failed to record tool use") from exc
     return tool_class
@@ -256,15 +285,23 @@ def record_tool_use(scope: str, tool_name: str) -> str:
 
 def filter_tools(tainted_class: str | None, tool_names: list[str]) -> tuple[list[str], list[str]]:
     """Advisory filter for the server-tool injection list: given the scope's
-    taint state, return ``(allowed, dropped)``.
+    taint state, return ``(allowed, dropped)`` — ``dropped`` is for the m2
+    loop's status/stream reporting.
 
     Pure function — pass it ``get_taint(scope)``. Unclassified names pass
     through (they are not governed by the trifecta rule), but the injection
-    list should only ever contain classified server tools.
+    list should only ever contain classified server tools. An unknown
+    *taint* class (out-of-band write, or a newer writer this build doesn't
+    know) fails toward fewer capabilities: every classified tool is dropped.
     """
     if tainted_class is None:
         return list(tool_names), []
-    blocked = _OPPOSING[tainted_class]
-    allowed = [t for t in tool_names if classify_tool(t) != blocked]
-    dropped = [t for t in tool_names if classify_tool(t) == blocked]
+    if tainted_class in _OPPOSING:
+        blocked = {_OPPOSING[tainted_class]}
+    else:
+        blocked = set(_OPPOSING)
+    allowed: list[str] = []
+    dropped: list[str] = []
+    for name in tool_names:
+        (dropped if classify_tool(name) in blocked else allowed).append(name)
     return allowed, dropped

@@ -127,6 +127,17 @@ def test_counter_ttls(fake_ddb, monkeypatch):
     )
 
 
+def test_scope_counter_ttl_tracks_taint_scope_ttl(fake_ddb, monkeypatch):
+    # Drift guard: the scope counter's lifetime comes from
+    # taint.scope_ttl_epoch, not a private copy — patching taint's TTL
+    # must move the budget counter's TTL with it.
+    monkeypatch.setattr(time, "time", lambda: 2_000_000.0)
+    monkeypatch.setattr(taint, "CONVERSATION_TAINT_TTL_DAYS", 1)
+    budget.check_and_consume(IDENTITY, CHAT_SCOPE)
+    counters = _counters(fake_ddb)
+    assert int(counters[f"scope#{CHAT_SCOPE}"]["ttl"]["N"]) == 2_000_000 + 86400
+
+
 # --- Fail closed -------------------------------------------------------------------
 
 

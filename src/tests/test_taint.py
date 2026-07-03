@@ -154,8 +154,6 @@ def test_same_class_stays_allowed_and_sticky(fake_ddb):
     assert taint.record_tool_use(CHAT_SCOPE, "gmail_get_message") == taint.INBOUND_PRIVATE
     item = fake_ddb.tables[TAINT_TABLE][CHAT_SCOPE]
     assert item["tainted_class"]["S"] == taint.INBOUND_PRIVATE
-    # first_tool records the taint origin, not the latest use.
-    assert item["first_tool"]["S"] == "gmail_search"
 
 
 def test_scopes_are_independent(fake_ddb):
@@ -178,6 +176,34 @@ def test_filter_never_drops_unclassified_names():
     allowed, dropped = taint.filter_tools(taint.INBOUND_PRIVATE, ["some_future_tool"])
     assert allowed == ["some_future_tool"]
     assert dropped == []
+
+
+def test_unknown_stored_taint_class_blocks_every_classified_tool():
+    # An out-of-band write (or a newer writer this build doesn't know)
+    # must fail toward fewer capabilities, not crash or pass everything.
+    allowed, dropped = taint.filter_tools("some-future-class", ["web_fetch", "gmail_search", "client_tool"])
+    assert allowed == ["client_tool"]
+    assert dropped == ["web_fetch", "gmail_search"]
+
+
+def test_conflict_error_reports_the_stored_class_not_an_inference(fake_ddb):
+    # The refused conditional write carries the pre-image (ALL_OLD); the
+    # error must name the class actually holding the scope even if the
+    # stored value is one this build's _OPPOSING map doesn't know.
+    fake_ddb._table(TAINT_TABLE)[CHAT_SCOPE] = {
+        "pk": {"S": CHAT_SCOPE},
+        "tainted_class": {"S": "some-future-class"},
+        "ttl": {"N": "9999999999"},
+    }
+    with pytest.raises(taint.TaintConflictError) as exc_info:
+        taint.record_tool_use(CHAT_SCOPE, "web_fetch")
+    assert exc_info.value.tainted_class == "some-future-class"
+
+
+def test_malformed_taint_item_fails_closed(fake_ddb):
+    fake_ddb._table(TAINT_TABLE)[CHAT_SCOPE] = {"pk": {"S": CHAT_SCOPE}, "ttl": {"N": "1"}}
+    with pytest.raises(taint.TaintStoreError):
+        taint.get_taint(CHAT_SCOPE)
 
 
 def test_record_refuses_client_tools(fake_ddb):

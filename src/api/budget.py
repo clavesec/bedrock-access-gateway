@@ -5,11 +5,15 @@ Per-turn caps (bytes, timeouts) bound a single fetch; budgets bound the
 identity. Two windows, both consumed before every server-side tool
 execution (m2/m3; client tools are never budgeted):
 
-    user-day   all tool calls by one identity in a UTC calendar day
-    scope      all tool calls within one taint scope (conversation via
+    user-day   all tool calls by one identity in a UTC calendar day —
+               the durable backstop
+    scope      tool calls within one taint scope (conversation via
                X-OpenWebUI-Chat-Id, or the session-keyed fallback — the
                same scope key as api.taint, so api-proxy callers are
-               covered from v1, R12)
+               covered from v1, R12). For session scopes this is a cap per
+               sliding 15-minute window, not a cumulative cap: the counter
+               expires with its scope. Conversation-scope counters live as
+               long as the conversation's taint state.
 
 Limits are config-driven with generous defaults — these are abuse
 backstops, not rate limits:
@@ -20,10 +24,19 @@ backstops, not rate limits:
 Counters live in DynamoDB (``TPAI_BUDGET_TABLE``): multiple gateway tasks
 run behind the ALB, so process-local counting undercounts. Each counter is
 an atomic conditional increment — ``ADD n 1`` guarded by ``n < limit`` —
-so concurrent calls cannot overshoot. The user-day counter is consumed
-first, then the scope counter; a call denied by the scope check therefore
-burns one user-day unit (bounded waste, at most SCOPE_LIMIT per scope per
-day) — accepted for the simplicity of never needing a rollback write.
+so concurrent calls cannot push a counter past its limit. (``ADD`` is not
+idempotent: a retried write whose first attempt committed can count one
+call twice. The limit invariant still holds — the over-count only ever errs
+toward denying sooner.)
+
+Accounting semantics (accepted for the simplicity of never needing rollback
+writes): the user-day counter is consumed first, then the scope counter, so
+a call denied by the scope check burns one user-day unit; and a call denied
+afterwards by the taint rule has already consumed both windows. Both burns
+are self-inflicted (scope keys embed the caller's own identity) and bounded
+— and the executor contract has the loop check its already-known taint
+state *before* consuming budget, which removes the taint-deny burn for
+every case except a genuine write race.
 
 Operating contract (same posture as ``api.audit`` / ``api.taint``):
 
@@ -34,19 +47,18 @@ Operating contract (same posture as ``api.audit`` / ``api.taint``):
   carries the tripped window; the m2 executor turns it into a denied tool
   call (audit ``policy_decision=deny``, ``policy_reason=budget-exhausted``)
   and a clean toolResult error to the model.
+- **Blocking I/O** — wrap in ``run_in_threadpool`` from async code, like
+  ``api.audit``.
 - **Dark today.** Nothing calls into this module until m2 Phase 0 lands.
 """
 
 import datetime
 import logging
 import os
-import threading
 import time
 
-import boto3
-from botocore.config import Config
-
-from api.taint import CONVERSATION_TAINT_TTL_DAYS, SESSION_TAINT_TTL_SECONDS
+from api import ddb
+from api import taint
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +69,6 @@ SCOPE_LIMIT = int(os.environ.get("TPAI_BUDGET_SCOPE_LIMIT", "128"))
 
 WINDOW_USER_DAY = "user-day"
 WINDOW_SCOPE = "scope"
-
-# Same critical-path rationale as the audit emitter and taint store.
-_DDB_CONFIG = Config(
-    connect_timeout=3,
-    read_timeout=5,
-    retries={"max_attempts": 2, "mode": "standard"},
-)
-
-_ddb_lock = threading.Lock()
-_ddb_client = None
 
 
 class BudgetStoreError(RuntimeError):
@@ -85,16 +87,9 @@ class BudgetExceededError(RuntimeError):
 
 
 def _ddb():
-    """Lazy singleton DynamoDB client — mirrors api.taint."""
-    global _ddb_client
-    with _ddb_lock:
-        if _ddb_client is None:
-            _ddb_client = boto3.client(
-                "dynamodb",
-                region_name=os.environ.get("AWS_REGION"),
-                config=_DDB_CONFIG,
-            )
-        return _ddb_client
+    """Indirection over the shared client so tests can stub this module's
+    store without touching the other consumers."""
+    return ddb.client()
 
 
 def _consume(counter_key: str, limit: int, window: str, ttl_epoch: int) -> None:
@@ -117,7 +112,7 @@ def _consume(counter_key: str, limit: int, window: str, ttl_epoch: int) -> None:
             },
         )
     except Exception as exc:
-        if type(exc).__name__ == "ConditionalCheckFailedException":
+        if ddb.is_conditional_check_failure(exc):
             raise BudgetExceededError(window, limit)
         logger.error("budget write failed (%s)", type(exc).__name__)
         raise BudgetStoreError("failed to consume budget") from exc
@@ -152,17 +147,13 @@ def check_and_consume(identity: str, scope: str) -> None:
     )
 
     # Scope counter: keyed by the taint-scope key (which embeds the
-    # identity), with the matching lifetime — conversation scopes count for
-    # the conversation's taint lifetime, session scopes for the sliding
-    # 15-minute window. Rotating chat ids to mint fresh scope budgets is
-    # bounded by the user-day counter above.
-    if scope.startswith("session#"):
-        scope_ttl = int(now) + SESSION_TAINT_TTL_SECONDS
-    else:
-        scope_ttl = int(now) + CONVERSATION_TAINT_TTL_DAYS * 86400
+    # identity), with the lifetime taken from the scope itself
+    # (taint.scope_ttl_epoch) so the counter and the scope's taint item can
+    # never expire on different schedules. Rotating chat ids to mint fresh
+    # scope budgets is bounded by the user-day counter above.
     _consume(
         counter_key=f"scope#{scope}",
         limit=SCOPE_LIMIT,
         window=WINDOW_SCOPE,
-        ttl_epoch=scope_ttl,
+        ttl_epoch=taint.scope_ttl_epoch(scope, now),
     )
