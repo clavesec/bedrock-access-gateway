@@ -6,19 +6,12 @@ rejection, enforcement-disabled (pre-flip / rollback) behavior, and the
 raw-email-never-logged log-capture assertion.
 """
 
-import hashlib
-import hmac
 import logging
 
 import api.identity as identity
-from tests.conftest import AUTH, CHAT_BODY
+from tests.conftest import AUTH, CHAT_BODY, expected_hmac
 
-TEST_KEY = "test-identity-hmac-key"
 TEST_EMAIL = "Alice.Example@Example.COM"
-
-
-def expected_hmac(domain: str, value: str) -> str:
-    return hmac.new(TEST_KEY.encode(), f"{domain}:{value}".encode(), hashlib.sha256).hexdigest()
 
 
 # --- Enforcement on identity-required routes ---------------------------------
