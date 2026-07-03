@@ -20,7 +20,7 @@ import pytest
 import api.audit as audit
 from tests.conftest import expected_hmac
 
-IDENTITY = expected_hmac("owui-email", "alice@example.com")
+IDENTITY = expected_hmac("owui-user-id", "a" * 64)
 TARGET = "https://example.com/reports/q3?token=SENTINEL-URL-SECRET"
 
 SYNTHETIC = dict(

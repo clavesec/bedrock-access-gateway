@@ -100,8 +100,11 @@ def test_unknown_binding_rejected():
 
 
 def test_missing_subject_is_a_clean_refusal(monkeypatch):
-    """No cross-check subject (e.g. OWUI omitted the User-Id header) means
-    no live-ness check is possible — refuse without invoking the Lambda."""
+    """No cross-check subject means no live-ness check is possible — refuse
+    without invoking the Lambda. Post-SH1 require_identity always sets the
+    subject on the OWUI path (User-Id-less requests 401 at ingestion), so
+    this guards a coding error at a future call site, not a request shape —
+    defense in depth, keep it."""
     fake = use_fake(monkeypatch, FakeLambda())
     with pytest.raises(mint.MintRefusedError, match="missing-subject"):
         mint.get_connector_token(IDENTITY, mint.BINDING_OWUI_SESSION, None)

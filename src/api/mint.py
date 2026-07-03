@@ -21,11 +21,13 @@ anywhere in the mint path — IAM is the caller auth, KMS is the signer).
 Identity-space note (E2): the mint request carries both pseudonym spaces —
 ``identity`` (the gateway's audit-space HMAC from ``api.identity``) and
 ``subject_id`` (the enrollment-space ``user_id`` that keys the session and
-api-key tables). They are deliberately unlinkable at rest; the pairing
-exists only inside this request and the mint Lambda's memory. Neither this
-module nor the Lambda may log the two together, and the minted JWT carries
-only ``sub=identity`` so the connector side never sees the enrollment
-pseudonym.
+api-key tables). Since the SH1 D7 adjustment the OWUI identity is *derived
+from* the subject (``HMAC(owui-user-id, subject)``), so the pairing is
+computable by anyone holding the Product-account identity key — see the E2
+scope note in ``api.identity``; what remains load-bearing here is hygiene,
+not unlinkability: neither this module nor the Lambda may log the two
+together, and the minted JWT carries only ``sub=identity`` so the connector
+side never sees the enrollment pseudonym.
 
 Operating contract (mirrors ``api.audit`` / ``api.taint``):
 
@@ -128,8 +130,12 @@ class MintedToken:
     # The subject the Lambda's live-ness cross-check ran against. A cache hit
     # requires the presented subject to match — a token verified for subject A
     # must never be served to a request asserting subject B under the same
-    # identity (possible only in the owui-session binding, e.g. an OWUI
-    # account recreated with the same email inside the TTL window).
+    # identity. Post-SH1 the owui-session identity is derived 1:1 from the
+    # subject, so divergence there is impossible; the live case is the
+    # api-key binding, where the identity HMAC lowercases the asserted user
+    # while the subject is case-preserved — two case variants of one api-key
+    # user share an identity but are distinct subjects, and the cross-check
+    # result must not leak between them.
     subject_id: str
 
     def fresh(self, now: float) -> bool:
@@ -233,9 +239,10 @@ def get_connector_token(identity: str, binding: str, subject_id: str | None) -> 
     with _cache_lock:
         cached = _token_cache.get(identity)
         if cached is not None and cached.fresh(now) and cached.subject_id == subject_id:
-            # Subject equality guards the owui-session binding: the cached
-            # token's live-session check ran against cached.subject_id, so a
-            # request asserting a different subject re-mints (and re-checks).
+            # Subject equality: the cached token's live-ness check ran
+            # against cached.subject_id, so a request asserting a different
+            # subject re-mints (and re-checks). See MintedToken.subject_id
+            # for why the live divergence case is the api-key binding.
             return cached
 
     minted = _invoke_mint(identity, binding, subject_id)

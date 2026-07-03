@@ -25,9 +25,16 @@ import api.identity as identity
 from api.routers.chat import _stream_with_access_log
 from tests.conftest import AUTH, CHAT_BODY, StubBedrockModel, expected_hmac
 
-TEST_EMAIL = "alice@example.com"
-EXPECTED_IDENTITY = expected_hmac("owui-email", TEST_EMAIL)
-IDENTITY_HEADERS = {**AUTH, identity.OWUI_EMAIL_HEADER: TEST_EMAIL}
+# Production header shape post-SH1 (D7 adjustment): identity from the
+# immutable user id; the email header rides along (empty for
+# billing-enrolled users) and is never used.
+TEST_USER_ID = "a" * 64
+EXPECTED_IDENTITY = expected_hmac("owui-user-id", TEST_USER_ID)
+IDENTITY_HEADERS = {
+    **AUTH,
+    identity.OWUI_USER_ID_HEADER: TEST_USER_ID,
+    identity.OWUI_EMAIL_HEADER: "",
+}
 
 # Sentinel content that must never surface in a log record.
 SENTINEL = "PHI-SENTINEL patient John Doe, MRN 0012345"
