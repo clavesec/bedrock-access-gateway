@@ -239,9 +239,10 @@ def get_connector_token(identity: str, binding: str, subject_id: str | None) -> 
     with _cache_lock:
         cached = _token_cache.get(identity)
         if cached is not None and cached.fresh(now) and cached.subject_id == subject_id:
-            # Subject equality guards the owui-session binding: the cached
-            # token's live-session check ran against cached.subject_id, so a
-            # request asserting a different subject re-mints (and re-checks).
+            # Subject equality: the cached token's live-ness check ran
+            # against cached.subject_id, so a request asserting a different
+            # subject re-mints (and re-checks). See MintedToken.subject_id
+            # for why the live divergence case is the api-key binding.
             return cached
 
     minted = _invoke_mint(identity, binding, subject_id)
