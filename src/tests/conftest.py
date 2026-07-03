@@ -43,7 +43,11 @@ CANNED_RESPONSE = ChatResponse(
 
 
 class StubBedrockModel:
-    """Stands in for BedrockModel so tests never touch AWS."""
+    """Stands in for BedrockModel so tests never touch AWS.
+
+    Mirrors the streaming contract the access log relies on: chat_stream
+    records ``stream_usage`` / ``stream_error`` on the instance.
+    """
 
     def validate(self, chat_request):
         return None
@@ -51,7 +55,11 @@ class StubBedrockModel:
     async def chat(self, chat_request):
         return CANNED_RESPONSE
 
-    def chat_stream(self, chat_request):
+    async def chat_stream(self, chat_request):
+        self.stream_usage = None
+        self.stream_error = False
+        yield b'data: {"choices":[{"delta":{"content":"Hello."}}]}\n\n'
+        self.stream_usage = CANNED_RESPONSE.usage
         yield b"data: [DONE]\n\n"
 
 

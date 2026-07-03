@@ -248,14 +248,14 @@ class BedrockModel(BaseChatModel):
             )
 
     async def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
-        """Common logic for invoke bedrock models"""
-        if DEBUG:
-            logger.info("Raw request: " + chat_request.model_dump_json())
+        """Common logic for invoke bedrock models.
 
+        Deliberately no request/response body logging here — not even behind
+        DEBUG (external-content decision E3): message content must never
+        reach CloudWatch. Metadata-only logging lives in api.access_log.
+        """
         # convert OpenAI chat request to Bedrock SDK request
         args = self._parse_request(chat_request)
-        if DEBUG:
-            logger.info("Bedrock request: " + json.dumps(str(args)))
 
         try:
             if stream:
@@ -296,8 +296,6 @@ class BedrockModel(BaseChatModel):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
-        if DEBUG:
-            logger.info("Proxy response :" + chat_response.model_dump_json())
         return chat_response
 
     async def _async_iterate(self, stream):
@@ -307,7 +305,14 @@ class BedrockModel(BaseChatModel):
             yield chunk
 
     async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
-        """Default implementation for Chat Stream API"""
+        """Default implementation for Chat Stream API.
+
+        Records ``stream_usage`` (token counts from the Bedrock metadata
+        chunk) and ``stream_error`` on the instance so the router can emit
+        the metadata-only access-log line once the stream finishes.
+        """
+        self.stream_usage = None
+        self.stream_error = False
         try:
             response = await self._invoke_bedrock(chat_request, stream=True)
             message_id = self.generate_message_id()
@@ -317,8 +322,8 @@ class BedrockModel(BaseChatModel):
                 stream_response = self._create_response_stream(**args)
                 if not stream_response:
                     continue
-                if DEBUG:
-                    logger.info("Proxy response :" + stream_response.model_dump_json())
+                if stream_response.usage:
+                    self.stream_usage = stream_response.usage
                 if stream_response.choices:
                     yield self.stream_response_to_bytes(stream_response)
                 elif chat_request.stream_options and chat_request.stream_options.include_usage:
@@ -333,6 +338,7 @@ class BedrockModel(BaseChatModel):
             # return an [DONE] message at the end.
             yield self.stream_response_to_bytes()
         except Exception as e:
+            self.stream_error = True
             logger.error("Stream error for model %s: %s", chat_request.model, str(e))
             error_event = Error(error=ErrorMessage(message=str(e)))
             yield self.stream_response_to_bytes(error_event)
@@ -703,9 +709,6 @@ class BedrockModel(BaseChatModel):
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#message-inference-examples
         """
-        if DEBUG:
-            logger.info("Bedrock response chunk: " + str(chunk))
-
         finish_reason = None
         message = None
         usage = None
@@ -938,8 +941,8 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
     def _invoke_model(self, args: dict, model_id: str):
         body = json.dumps(args)
         if DEBUG:
+            # Model id only — request bodies are never logged (E3).
             logger.info("Invoke Bedrock Model: " + model_id)
-            logger.info("Bedrock request body: " + body)
         try:
             return bedrock_runtime.invoke_model(
                 body=body,
@@ -982,8 +985,6 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
                 total_tokens=input_tokens + output_tokens,
             ),
         )
-        if DEBUG:
-            logger.info("Proxy response :" + response.model_dump_json())
         return response
 
 
@@ -1031,9 +1032,6 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
             args=self._parse_args(embeddings_request), model_id=embeddings_request.model
         )
         response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
-
         return self._create_response(
             embeddings=response_body["embeddings"],
             model=embeddings_request.model,
@@ -1071,9 +1069,6 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
             args=self._parse_args(embeddings_request), model_id=embeddings_request.model
         )
         response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
-
         return self._create_response(
             embeddings=[response_body["embedding"]],
             model=embeddings_request.model,
