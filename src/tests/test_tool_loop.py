@@ -233,6 +233,31 @@ def test_prompt_cache_point_rides_continuations_when_enabled(monkeypatch, contro
     assert fake.calls[1]["messages"][-1]["content"][-1] == {"cachePoint": {"type": "default"}}
 
 
+def test_cache_points_are_pruned_to_the_claude_ceiling(monkeypatch, controls):
+    """5 continuation rounds would carry 5 cachePoints — one over Claude's
+    4-checkpoint Converse limit; the oldest must be pruned."""
+    monkeypatch.setattr(setting, "WEB_FETCH_PROMPT_CACHE", True)
+    fake = install_runtime(
+        monkeypatch,
+        FakeBedrockRuntime(
+            responses=[tool_use_response({"url_index": 0}) for _ in range(5)] + [final_response()]
+        ),
+    )
+    run(BedrockModel().chat(chat_request(), CTX))
+    # 4 fetch rounds + 1 denied round appended -> the 6th Converse call.
+    final_messages = fake.calls[5]["messages"]
+    cache_points = sum(
+        1
+        for message in final_messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and "cachePoint" in block
+    )
+    assert cache_points == 4
+    # The newest round keeps its marker.
+    assert final_messages[-1]["content"][-1] == {"cachePoint": {"type": "default"}}
+
+
 # -------------------------------------------------------------- smuggling
 
 
@@ -287,8 +312,10 @@ def test_iteration_cap_bounds_the_loop(monkeypatch, controls):
     # 1 fetch round + 1 denied round + 1 forced final = 3 Converse calls.
     assert len(fake.calls) == 3
     assert controls["fetches"] == ["https://a.example/1"]
+    # The attempt made AFTER the denied round is audited too — the WORM
+    # trail records attempts, not just executions.
     reasons = [r["policy_reason"] for r in controls["records"]]
-    assert reasons == ["beta-allow-all", "iteration-cap"]
+    assert reasons == ["beta-allow-all", "iteration-cap", "iteration-cap"]
     # The forced final is text-only — no tool_calls surfaced to a client
     # that declared no tools.
     assert response.choices[0].message.tool_calls is None
@@ -310,6 +337,23 @@ def test_executor_crash_fails_closed_as_toolresult_error(monkeypatch, controls):
     tool_result = fake.calls[1]["messages"][-1]["content"][0]["toolResult"]
     assert tool_result["status"] == "error"
     assert response.choices[0].message.content == "Here is the summary."
+    # Even the crashed call leaves a best-effort audit record.
+    assert [r["policy_reason"] for r in controls["records"]] == ["executor-error"]
+
+
+def test_stream_planning_error_surfaces_as_in_band_sse_error(monkeypatch, controls):
+    """A planning failure after the 200 headers are sent must become the
+    documented in-band SSE error event, not a severed connection."""
+
+    def boom(chat_request_arg, ctx):
+        raise RuntimeError("planning bug")
+
+    monkeypatch.setattr(executor, "plan_server_tools", boom)
+    install_runtime(monkeypatch, FakeBedrockRuntime())
+    model = BedrockModel()
+    chunks = collect_stream(model.chat_stream(chat_request(stream=True), CTX))
+    assert model.stream_error is True
+    assert any('"error"' in c for c in chunks)
 
 
 # ----------------------------------------------------------------- stream
@@ -461,6 +505,7 @@ def test_stream_iteration_cap_ends_cleanly(monkeypatch, controls):
     assert controls["fetches"] == ["https://a.example/1"]
     assert [r["policy_reason"] for r in controls["records"]] == [
         "beta-allow-all",
+        "iteration-cap",
         "iteration-cap",
     ]
     assert "tool_calls" not in joined

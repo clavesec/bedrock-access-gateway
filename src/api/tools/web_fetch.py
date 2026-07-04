@@ -47,6 +47,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -117,12 +118,17 @@ def _session() -> requests.Session:
     """Lazy singleton HTTP session (connection reuse across loop rounds;
     nothing AWS-flavored is resolved at import for this dark path)."""
     global _http_session
+    if _http_session is not None:
+        # Fast path: module-global reads are atomic; the lock only guards
+        # first construction so concurrent fetches never serialize on it.
+        return _http_session
     with _session_lock:
         if _http_session is None:
-            _http_session = requests.Session()
+            session = requests.Session()
             # The gateway task has no proxy and no route beyond the VPC; a
             # trust_env proxy var must never redirect connector traffic.
-            _http_session.trust_env = False
+            session.trust_env = False
+            _http_session = session
         return _http_session
 
 
@@ -161,7 +167,15 @@ def extract_human_urls(messages) -> list[str]:
                 # a regex edit can never silently widen the scheme set.
                 if not url.lower().startswith(("http://", "https://")):
                     continue
-                if urlsplit(url).hostname is None:
+                try:
+                    hostname = urlsplit(url).hostname
+                except ValueError:
+                    # urlsplit raises on bracket-malformed hosts (e.g. the
+                    # regex matching "http://[your-server]/x" placeholder
+                    # text). Chat content must never crash the request —
+                    # skip the non-URL.
+                    continue
+                if hostname is None:
                     continue
                 if url in seen:
                     continue
@@ -302,16 +316,26 @@ def execute_web_fetch(url: str, token: str) -> FetchResult:
         logger.error("connector fetch transport failure (%s)", type(exc).__name__)
         raise WebFetchError("connector fetch failed") from exc
 
-    with response:
-        if response.status_code == 401:
-            raise WebFetchAuthError("connector rejected the token")
-        if response.status_code == 403:
-            raise WebFetchDenied(_denial_reason(response))
-        if response.status_code == 504:
-            raise WebFetchError("connector reported an origin timeout", outcome="timeout")
-        if response.status_code != 200:
-            raise WebFetchError(f"connector returned status {response.status_code}")
-        payload = _read_capped_json(response)
+    # Body reads happen below (stream=True defers them past post()), so
+    # transport failures mid-body must be mapped here too — a raw requests
+    # exception escaping this function would bypass the executor's audit
+    # branch entirely.
+    try:
+        with response:
+            if response.status_code == 401:
+                raise WebFetchAuthError("connector rejected the token")
+            if response.status_code == 403:
+                raise WebFetchDenied(_denial_reason(response))
+            if response.status_code == 504:
+                raise WebFetchError("connector reported an origin timeout", outcome="timeout")
+            if response.status_code != 200:
+                raise WebFetchError(f"connector returned status {response.status_code}")
+            payload = _read_capped_json(response)
+    except requests.exceptions.Timeout as exc:
+        raise WebFetchError("connector body read timed out", outcome="timeout") from exc
+    except requests.exceptions.RequestException as exc:
+        logger.error("connector body read failure (%s)", type(exc).__name__)
+        raise WebFetchError("connector fetch failed mid-body") from exc
 
     content = payload.get("content")
     if not isinstance(content, str):
@@ -329,24 +353,43 @@ def execute_web_fetch(url: str, token: str) -> FetchResult:
 
 
 def _denial_reason(response) -> str:
-    """The connector's policy_reason from a 403 body, defensively parsed."""
+    """The connector's policy_reason from a 403 body, defensively parsed.
+
+    Reads via iter_content with a small cap — ``response.content`` on a
+    stream=True response would buffer the entire body before slicing, an
+    unbounded read a misbehaving connector could exploit.
+    """
     try:
-        payload = json.loads(response.content[:4096])
+        body = b""
+        for chunk in response.iter_content(chunk_size=4096):
+            body += chunk
+            if len(body) >= 4096:
+                break
+        payload = json.loads(body[:4096])
         reason = payload.get("reason")
         if isinstance(reason, str) and reason:
             # The reason lands in the audit record; bound and sanitize it so
             # a misbehaving connector cannot inject structure.
             return re.sub(r"[^A-Za-z0-9._-]", "", reason)[:64] or "connector-denied"
-    except (ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError, requests.exceptions.RequestException):
         pass
     return "connector-denied"
 
 
 def _read_capped_json(response) -> dict:
-    """Read the connector response body, hard-capped at WEB_FETCH_MAX_BYTES."""
+    """Read the connector response body, hard-capped at WEB_FETCH_MAX_BYTES
+    and bounded by a wall-clock deadline.
+
+    The requests read timeout is per socket read, not per call — without the
+    deadline a connector dripping one chunk per read-timeout window could
+    hold the threadpool thread (and the user's request) open for hours.
+    """
+    deadline = time.monotonic() + setting.WEB_FETCH_CONNECTOR_TIMEOUT_S
     chunks: list[bytes] = []
     total = 0
     for chunk in response.iter_content(chunk_size=65536):
+        if time.monotonic() > deadline:
+            raise WebFetchError("connector response exceeded the total read deadline", outcome="timeout")
         total += len(chunk)
         if total > setting.WEB_FETCH_MAX_BYTES:
             raise WebFetchError("connector response exceeds the byte cap")

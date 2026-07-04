@@ -53,20 +53,27 @@ Single function, every branch audited (`docs/AuditRecords.md`), in the
 ratified order of `docs/TaintAndBudgets.md`:
 
 ```
+resolve url_index (pure)     → denies below carry the full URL (R11)
 dropped-by-filter?           → deny  taint-blocked        (no budget burn)
-resolve url_index            → deny  invalid-url-index    (no budget burn)
+url unresolvable             → deny  invalid-url-index    (no budget burn)
 gateway allowlist (R5)       → allow beta-allow-all | allowlist-hit
                                deny  allowlist-miss
 budget.check_and_consume     → deny  budget-exhausted   | fail budget-store-error
 taint.record_tool_use        → deny  taint-blocked      | fail taint-store-error
-mint.get_connector_token     → deny  mint-refused:<why> | fail mint-error
-execute via connector        → success | denied (connector policy) | error | timeout
+mint + execute via connector → success | deny mint-refused:<why> | denied
+                               (connector policy) | error | timeout
 audit at completion          → AuditEmitError ⇒ fetched content DISCARDED (fail closed)
 ```
 
 Deny/fail branches return a clean toolResult error message (the model can
-still answer); nothing unaudited ever reaches the conversation. The
-iteration-cap deny (`policy_reason=iteration-cap`) is also audited.
+still answer); nothing unaudited ever reaches the conversation. Also
+audited: the iteration-cap deny (`policy_reason=iteration-cap`, including
+tool calls the model makes *after* the denied round), and crashed executor
+calls (the loop's catch-all routes through `executor.unexpected_failure`,
+which writes a best-effort `executor-error` record). Audit pairing: `deny`+
+`denied` = clean policy deny; `deny`+`error` = fail-closed control failure;
+`allow`+`error`/`timeout` = execution failure after allow (see
+`docs/AuditRecords.md`).
 
 ## Converse-loop invariants (`models/bedrock.py`)
 
@@ -138,10 +145,12 @@ Content-Type: application/json
 
 The gateway requires only `content` (string) and treats `truncated` as
 advisory; **gateway-side caps apply regardless** (defense in depth against
-a compromised connector): response body read ≤ `WEB_FETCH_MAX_BYTES`,
-`content` truncated to `WEB_FETCH_MAX_CHARS`, read timeout
-`WEB_FETCH_CONNECTOR_TIMEOUT_S` (must exceed the connector's origin timeout
-plus its quarantine pass). The connector owns the transport SSRF guard
+a compromised connector): response body read ≤ `WEB_FETCH_MAX_BYTES` (all
+statuses — the 403 reason parse is capped too), `content` truncated to
+`WEB_FETCH_MAX_CHARS`, and `WEB_FETCH_CONNECTOR_TIMEOUT_S` applied both as
+the socket read timeout and as a total body-read deadline (a drip-feeding
+connector cannot hold the call open past it). It must exceed the
+connector's origin timeout plus its quarantine pass. The connector owns the transport SSRF guard
 (scheme/metadata/RFC1918/loopback + per-hop redirect re-validation with IP
 pinning), the URL policy layer, HTML→text extraction, the quarantined-model
 pass, and its own audit record (the m3 G4 review pairs it with the

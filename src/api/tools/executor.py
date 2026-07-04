@@ -5,7 +5,9 @@ the audit requirement in ``docs/AuditRecords.md``: every server-side tool
 call — success, denied, error, or timeout — flows through
 ``run_server_tool``, which sequences the controls in the ratified order and
 emits exactly one WORM audit record per call. The Converse loop in
-``models/bedrock.py`` never calls taint/budget/audit/mint directly.
+``models/bedrock.py`` never calls taint/budget/audit/mint directly; its
+catch-all for unexpected executor failures goes through
+``unexpected_failure`` so even a crashed call leaves a best-effort record.
 
 Planning (``plan_server_tools``) decides whether this request gets server
 tools at all. The injection list is built from the gateway's own registry
@@ -14,11 +16,26 @@ names appearing in the request (a client tool that happens to be named
 ``web_fetch`` is still a client tool and bypasses this module entirely,
 because the presence of *any* client tool disables injection).
 
+web_fetch is the only registered tool today; ``run_server_tool`` guards its
+dispatch loudly (`ValueError`) so an m3 session that registers gmail tools
+in ``taint.TOOL_CLASSES``/``registry_tools`` without adding an execution
+handler here fails at the enforcement point instead of being misrouted
+through the web_fetch pipeline.
+
 Everything here is blocking I/O (DynamoDB, S3, Lambda, HTTP) — the async
-Converse loop must call ``plan_server_tools`` and ``run_server_tool`` via
+Converse loop must call ``plan_server_tools``, ``run_server_tool``,
+``deny_iteration_cap``, and ``unexpected_failure`` via
 ``starlette.concurrency.run_in_threadpool``.
 
 E3: no log line in this module carries URLs, content, or tokens.
+
+Audit pairing note (extends docs/AuditRecords.md for the fail-closed rows):
+``policy_decision=deny`` + ``outcome=denied`` is a clean policy deny;
+``policy_decision=deny`` + ``outcome=error|timeout`` is a fail-closed
+control failure (store/mint/transport — the call was refused because a
+control could not run, not by a policy choice); ``policy_decision=allow``
++ ``outcome=error|timeout`` is an execution failure after the policy
+allowed the fetch. ``policy_reason`` names the specific control.
 """
 
 import logging
@@ -30,10 +47,12 @@ from api.tools import web_fetch
 
 logger = logging.getLogger(__name__)
 
-# Generic error text returned to the model when a control or the transport
-# fails closed. Deliberately detail-free: failure specifics belong in
-# metadata logs and the audit trail, not in the conversation.
-_INTERNAL_ERROR_TEXT = "web_fetch failed: internal error. Answer with the information you already have."
+
+def internal_error_text(tool_name: str) -> str:
+    """Model-facing text when a control or the transport fails closed.
+    Deliberately detail-free: failure specifics belong in metadata logs and
+    the audit trail, not in the conversation."""
+    return f"{tool_name} failed: internal error. Answer with the information you already have."
 
 
 @dataclass(frozen=True)
@@ -72,10 +91,18 @@ class ToolOutcome:
         return self.outcome == "success"
 
 
+def loggable_tool_name(tool_name: str) -> str:
+    """A safe label for the E3 access-log line: the raw toolUse name is
+    model-emitted (and, via fetched content, attacker-influenceable), so
+    anything outside the registry is collapsed to a constant."""
+    return tool_name if tool_name in taint.TOOL_CLASSES else "unregistered-tool"
+
+
 def registry_tools(model: str) -> list[str]:
     """Server tools this deployment offers for this model — the gateway's
-    own registry, flag-gated (m3 sessions extend this alongside
-    ``taint.TOOL_CLASSES``)."""
+    own registry, flag-gated. m3 sessions extend this alongside
+    ``taint.TOOL_CLASSES`` AND must give ``run_server_tool`` an execution
+    handler for every name added here (it fails loudly otherwise)."""
     tools: list[str] = []
     if setting.ENABLE_WEB_FETCH_TOOL and (
         setting.WEB_FETCH_MODELS_ALL or "anthropic" in model.lower()
@@ -86,8 +113,10 @@ def registry_tools(model: str) -> list[str]:
 
 def server_tools_enabled(chat_request) -> bool:
     """Cheap, I/O-free pre-gate so the dark/default path never pays a
-    threadpool hop: flags off, client tools present, or reasoning requests
-    all short-circuit here. ``plan_server_tools`` re-checks everything."""
+    threadpool hop: flags off, client tools present, reasoning requests, or
+    nothing fetchable all short-circuit here (URL extraction is pure CPU —
+    regex over the request — so it belongs on this side of the hop).
+    ``plan_server_tools`` re-checks everything."""
     if chat_request.tools:
         # Loop invariant: any client tool present -> the response is returned
         # untouched, so server tools are never injected alongside them.
@@ -96,7 +125,14 @@ def server_tools_enabled(chat_request) -> bool:
         # Reasoning turns require round-tripping signed thinking blocks
         # through the continuation conversation — out of scope for v1.
         return False
-    return bool(registry_tools(chat_request.model))
+    tools = registry_tools(chat_request.model)
+    if not tools:
+        return False
+    if tools == [web_fetch.TOOL_NAME] and not web_fetch.extract_human_urls(chat_request.messages):
+        # web_fetch is the only candidate and there is nothing fetchable in
+        # the human turns (D3) — skip the threadpool hop and the taint read.
+        return False
+    return True
 
 
 def plan_server_tools(chat_request, ctx: ServerToolContext | None) -> ServerToolPlan | None:
@@ -131,14 +167,14 @@ def plan_server_tools(chat_request, ctx: ServerToolContext | None) -> ServerTool
         logger.warning("taint state unreadable - not injecting server tools (fail closed)")
         return None
     allowed, dropped = taint.filter_tools(tainted, tools)
-    if not allowed:
-        return None
-
-    specs = [web_fetch.build_tool_spec(urls) for name in allowed if name == web_fetch.TOOL_NAME]
-    if not specs:
+    if web_fetch.TOOL_NAME not in allowed:
+        # web_fetch is the only tool with a spec builder today.
         return None
     return ServerToolPlan(
-        tool_config={"tools": specs, "toolChoice": {"auto": {}}},
+        tool_config={
+            "tools": [web_fetch.build_tool_spec(urls)],
+            "toolChoice": {"auto": {}},
+        },
         urls=urls,
         scope=scope,
         injected=allowed,
@@ -146,64 +182,91 @@ def plan_server_tools(chat_request, ctx: ServerToolContext | None) -> ServerTool
     )
 
 
+def _emit_record(
+    ctx: ServerToolContext,
+    tool_name: str,
+    *,
+    target: str,
+    decision: str,
+    reason: str,
+    outcome: str,
+    bytes_returned: int | None,
+    latency_ms: int,
+) -> None:
+    """The one place audit records are shaped — every emitter in this module
+    goes through it so the field contract cannot drift between branches."""
+    audit.emit_audit_record(
+        identity=ctx.identity,
+        tool=tool_name,
+        target=target,
+        policy_decision=decision,
+        policy_reason=reason,
+        outcome=outcome,
+        bytes_returned=bytes_returned,
+        latency_ms=latency_ms,
+        conversation_id=ctx.chat_id,
+    )
+
+
 def run_server_tool(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str, tool_input) -> ToolOutcome:
     """Execute one server tool call through the full control sequence.
 
     Order (docs/TaintAndBudgets.md): known-deny checks that need no store
-    round-trip (dropped-by-filter, unresolvable URL index) -> budget ->
-    taint record -> mint -> execute -> audit at completion. Deny branches
-    emit their audit record immediately; the execute branch emits exactly
-    one record once the outcome (success/error/timeout), byte count, and
-    latency are known — and if that record cannot be written, the fetched
-    content is discarded and the call fails (a retrieval that cannot be
-    audited must not reach the model).
+    round-trip (dropped-by-filter, unresolvable URL index, gateway
+    allowlist) -> budget -> taint record -> mint+execute -> audit at
+    completion. Deny branches emit their audit record immediately; the
+    execute branch emits exactly one record once the outcome
+    (success/error/timeout), byte count, and latency are known — and if
+    that record cannot be written, the fetched content is discarded and the
+    call fails (a retrieval that cannot be audited must not reach the
+    model).
     """
     started = time.monotonic()
 
     def latency_ms() -> int:
         return int((time.monotonic() - started) * 1000)
 
-    def emit(target: str, decision: str, reason: str, outcome: str, bytes_returned: int | None) -> None:
-        audit.emit_audit_record(
-            identity=ctx.identity,
-            tool=tool_name,
-            target=target,
-            policy_decision=decision,
-            policy_reason=reason,
-            outcome=outcome,
-            bytes_returned=bytes_returned,
-            latency_ms=latency_ms(),
-            conversation_id=ctx.chat_id,
-        )
-
     def deny(target: str, reason: str, message: str) -> ToolOutcome:
-        emit(target, "deny", reason, "denied", None)
+        _emit_record(
+            ctx, tool_name, target=target, decision="deny", reason=reason,
+            outcome="denied", bytes_returned=None, latency_ms=latency_ms(),
+        )
         return ToolOutcome(result_text=message, outcome="denied")
 
-    def fail(target: str, reason: str, outcome: str = "error") -> ToolOutcome:
-        emit(target, "deny", reason, outcome, None)
-        return ToolOutcome(result_text=_INTERNAL_ERROR_TEXT, outcome=outcome)
+    def fail(target: str, reason: str) -> ToolOutcome:
+        # Fail-closed control failure: decision=deny + outcome=error (see
+        # the module-docstring pairing note).
+        _emit_record(
+            ctx, tool_name, target=target, decision="deny", reason=reason,
+            outcome="error", bytes_returned=None, latency_ms=latency_ms(),
+        )
+        return ToolOutcome(result_text=internal_error_text(tool_name), outcome="error")
 
     if tool_name not in taint.TOOL_CLASSES:
         # The loop only dispatches names it injected, so this is a bug —
         # fail closed at the enforcement point (TaintAndBudgets contract).
         raise ValueError(f"tool {tool_name!r} is not a registered server-side tool")
 
+    # D3: resolve the input to a human-turn URL first — pure in-memory, and
+    # every subsequent record (including denies) then carries the full URL
+    # (R11) rather than a placeholder.
+    url = web_fetch.resolve_url(plan.urls, tool_input)
+
     if tool_name in plan.dropped:
         # 2a: the advisory filter already removed this class for the scope —
         # the taint outcome is known, deny without consuming budget.
         return deny(
-            "blocked:taint",
+            url or "invalid:url_index",
             "taint-blocked",
-            "web_fetch is not available in this conversation (external-content policy).",
+            f"{tool_name} is not available in this conversation (external-content policy).",
         )
     if tool_name not in plan.injected:
         raise ValueError(f"tool {tool_name!r} was not planned for this request")
+    if tool_name != web_fetch.TOOL_NAME:
+        # Registered and planned but no execution handler in this build —
+        # fail loudly rather than misroute through the web_fetch pipeline.
+        raise ValueError(f"no executor handler for tool {tool_name!r}")
 
-    # D3 enforcement: the input must resolve to a URL from the human-turn
-    # list. Anything else — free URL strings included — is a policy deny,
-    # decided before any store round-trip (outcome already known, like 2a).
-    url = web_fetch.resolve_url(plan.urls, tool_input)
     if url is None:
         return deny(
             "invalid:url_index",
@@ -223,7 +286,7 @@ def run_server_tool(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str
         return deny(
             url,
             "budget-exhausted",
-            f"web_fetch denied: the {exc.window} tool-call budget is exhausted. "
+            f"{tool_name} denied: the {exc.window} tool-call budget is exhausted. "
             "Answer with the information you already have.",
         )
     except budget.BudgetStoreError:
@@ -235,40 +298,30 @@ def run_server_tool(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str
         return deny(
             url,
             "taint-blocked",
-            "web_fetch is not available in this conversation (external-content policy).",
+            f"{tool_name} is not available in this conversation (external-content policy).",
         )
     except taint.TaintStoreError:
         return fail(url, "taint-store-error")
 
     try:
-        token = mint.get_connector_token(ctx.identity, ctx.binding, ctx.subject_id)
+        result = _mint_and_fetch(ctx, url)
     except mint.MintRefusedError as exc:
         return deny(
             url,
             f"mint-refused:{exc.reason}",
-            "web_fetch denied: no live session or credential for this user.",
+            f"{tool_name} denied: no live session or credential for this user.",
         )
     except (mint.MintError, ValueError):
         return fail(url, "mint-error")
-
-    try:
-        result = _fetch_with_reauth(ctx, url, token)
     except web_fetch.WebFetchDenied as exc:
         return deny(url, exc.reason, "web_fetch denied: this destination is not allowed.")
     except web_fetch.WebFetchAuthError:
         return fail(url, "connector-auth")
-    except mint.MintRefusedError as exc:
-        # The re-mint after a 401 can itself be refused (session ended
-        # mid-conversation) — same clean deny as the primary mint path.
-        return deny(
-            url,
-            f"mint-refused:{exc.reason}",
-            "web_fetch denied: no live session or credential for this user.",
-        )
-    except mint.MintError:
-        return fail(url, "mint-error")
     except web_fetch.WebFetchError as exc:
-        emit(url, "allow", gateway_policy_reason, exc.outcome, None)
+        _emit_record(
+            ctx, tool_name, target=url, decision="allow", reason=gateway_policy_reason,
+            outcome=exc.outcome, bytes_returned=None, latency_ms=latency_ms(),
+        )
         message = (
             "web_fetch error: the fetch timed out."
             if exc.outcome == "timeout"
@@ -280,11 +333,14 @@ def run_server_tool(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str
     if result.truncated:
         fenced += "\n[Content truncated at the configured cap.]"
     try:
-        emit(url, "allow", gateway_policy_reason, "success", result.bytes_returned)
+        _emit_record(
+            ctx, tool_name, target=url, decision="allow", reason=gateway_policy_reason,
+            outcome="success", bytes_returned=result.bytes_returned, latency_ms=latency_ms(),
+        )
     except audit.AuditEmitError:
         # Retrieval happened but cannot be audited: discard the content so
         # nothing unaudited ever reaches the model (fail closed).
-        return ToolOutcome(result_text=_INTERNAL_ERROR_TEXT, outcome="error")
+        return ToolOutcome(result_text=internal_error_text(tool_name), outcome="error")
     return ToolOutcome(result_text=fenced, outcome="success")
 
 
@@ -296,29 +352,42 @@ def deny_iteration_cap(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: 
     is known without any store round-trip.
     """
     url = web_fetch.resolve_url(plan.urls, tool_input) or "invalid:url_index"
-    audit.emit_audit_record(
-        identity=ctx.identity,
-        tool=tool_name,
-        target=url,
-        policy_decision="deny",
-        policy_reason="iteration-cap",
-        outcome="denied",
-        bytes_returned=None,
-        latency_ms=0,
-        conversation_id=ctx.chat_id,
+    _emit_record(
+        ctx, tool_name, target=url, decision="deny", reason="iteration-cap",
+        outcome="denied", bytes_returned=None, latency_ms=0,
     )
     return ToolOutcome(
         result_text=(
-            "web_fetch denied: the fetch limit for this request is reached. "
+            f"{tool_name} denied: the fetch limit for this request is reached. "
             "Answer with the information you already have."
         ),
         outcome="denied",
     )
 
 
-def _fetch_with_reauth(ctx: ServerToolContext, url: str, token) -> web_fetch.FetchResult:
-    """Execute the fetch, re-minting exactly once if the connector rejects
-    the (possibly cached-stale) token."""
+def unexpected_failure(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str, tool_input) -> ToolOutcome:
+    """Outcome for a tool call whose executor crashed (loop catch-all).
+
+    Best-effort audit so even a crashed call leaves a record ("emits on all
+    branches" — docs/AuditRecords.md); if the record itself cannot be
+    written there is nothing left to fail closed over, so the emit error is
+    swallowed (exception class logged, never fields).
+    """
+    target = web_fetch.resolve_url(plan.urls, tool_input) if isinstance(tool_input, dict) else None
+    try:
+        _emit_record(
+            ctx, tool_name, target=target or "invalid:url_index", decision="deny",
+            reason="executor-error", outcome="error", bytes_returned=None, latency_ms=0,
+        )
+    except Exception as exc:
+        logger.error("audit record for crashed tool call failed (%s)", type(exc).__name__)
+    return ToolOutcome(result_text=internal_error_text(tool_name), outcome="error")
+
+
+def _mint_and_fetch(ctx: ServerToolContext, url: str) -> web_fetch.FetchResult:
+    """Mint (cached) and execute the fetch, re-minting exactly once if the
+    connector rejects a possibly cached-stale token."""
+    token = mint.get_connector_token(ctx.identity, ctx.binding, ctx.subject_id)
     try:
         return web_fetch.execute_web_fetch(url, token.token)
     except web_fetch.WebFetchAuthError:

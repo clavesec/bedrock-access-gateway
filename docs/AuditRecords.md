@@ -27,9 +27,9 @@ always present (nullable fields serialize as `null`, never omitted).
 | `identity` | string | Pseudonymous HMAC identity from `api/identity.py` (dedicated Product-account key, decision E2). Required — tool execution is only reachable behind `require_identity`. Never the raw email. |
 | `tool` | string | Tool name, e.g. `web_fetch`, `gmail_search`, `gmail_get_message`. |
 | `target` | string | **The full URL** (web tools — R11 requires full URL, not just host) or the **message id** (gmail tools). |
-| `policy_decision` | string | `allow` \| `deny` — what the URL/tool policy layer decided. |
-| `policy_reason` | string | Why, e.g. `beta-allow-all`, `allowlist-hit`, `allowlist-miss`, `taint-blocked`, `budget-exhausted` (R11: the allowlist/policy-decision reason is part of the record). |
-| `outcome` | string | `success` \| `denied` \| `error` \| `timeout` — how the call actually ended. A `deny` decision pairs with outcome `denied`. |
+| `policy_decision` | string | `allow` \| `deny` — whether the gateway let the call proceed. |
+| `policy_reason` | string | Why, e.g. `beta-allow-all`, `allowlist-hit`, `allowlist-miss`, `taint-blocked`, `budget-exhausted`, `iteration-cap`, `invalid-url-index`, `mint-refused:<why>`, `budget-store-error`, `executor-error` (R11: the allowlist/policy-decision reason is part of the record). |
+| `outcome` | string | `success` \| `denied` \| `error` \| `timeout` — how the call actually ended. Pairings (m2 executor): `deny`+`denied` = clean policy deny; `deny`+`error` = **fail-closed control failure** (a store/mint/transport control could not run, so the call was refused — `policy_reason` names the control, e.g. `taint-store-error`); `allow`+`error`/`timeout` = execution failed after policy allowed the fetch. |
 | `bytes` | int \| null | Content bytes returned to the model. `null` when nothing was returned (denied/error paths). |
 | `latency_ms` | int | Wall-clock duration of the tool execution. |
 | `conversation_id` | string \| null | `X-OpenWebUI-Chat-Id` when present (arrives with the m1 Phase D cherry-pick). `null` for background generations and api-proxy callers — those use the session-keyed taint fallback (D9). |

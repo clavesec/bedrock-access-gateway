@@ -303,6 +303,59 @@ def test_unregistered_tool_name_fails_closed(recorder, plan):
     assert recorder.fetches == []
 
 
+def test_registered_tool_without_a_handler_fails_loudly(recorder, plan):
+    """gmail_search is taint-classified (m3) but has no execution handler in
+    this build — it must raise at the enforcement point, never be misrouted
+    through the web_fetch pipeline as an invalid-url-index deny."""
+    gmail_plan = executor.ServerToolPlan(
+        tool_config=plan.tool_config,
+        urls=plan.urls,
+        scope=plan.scope,
+        injected=["gmail_search"],
+        dropped=[],
+    )
+    with pytest.raises(ValueError, match="no executor handler"):
+        executor.run_server_tool(gmail_plan, CTX, "gmail_search", {"query": "x"})
+    assert recorder.fetches == []
+
+
+def test_taint_dropped_deny_records_the_full_url(recorder, plan):
+    """R11: even the step-2a deny (advisory filter already removed the
+    class) must carry the attempted full URL — resolution is pure and needs
+    no store round-trip."""
+    dropped_plan = executor.ServerToolPlan(
+        tool_config=plan.tool_config,
+        urls=plan.urls,
+        scope=plan.scope,
+        injected=[],
+        dropped=["web_fetch"],
+    )
+    outcome = executor.run_server_tool(dropped_plan, CTX, "web_fetch", {"url_index": 0})
+    assert outcome.outcome == "denied"
+    assert recorder.order == ["audit"]  # no budget burn
+    record = recorder.records[0]
+    assert record["policy_reason"] == "taint-blocked"
+    assert record["target"] == "https://a.example/1"
+
+
+def test_unexpected_failure_writes_a_best_effort_record(recorder, plan):
+    outcome = executor.unexpected_failure(plan, CTX, "web_fetch", {"url_index": 0})
+    assert outcome.outcome == "error"
+    record = recorder.records[0]
+    assert record["policy_reason"] == "executor-error"
+    assert record["target"] == "https://a.example/1"
+    # And it swallows audit failures — there is nothing left to fail closed
+    # over when the record itself cannot be written.
+    recorder.audit_exc = audit.AuditEmitError("sink down")
+    outcome = executor.unexpected_failure(plan, CTX, "web_fetch", {"url_index": 0})
+    assert outcome.outcome == "error"
+
+
+def test_loggable_tool_name_collapses_unregistered_names():
+    assert executor.loggable_tool_name("web_fetch") == "web_fetch"
+    assert executor.loggable_tool_name("exfil<data>") == "unregistered-tool"
+
+
 def test_iteration_cap_denial_is_audited_without_budget_burn(recorder, plan):
     outcome = executor.deny_iteration_cap(plan, CTX, "web_fetch", {"url_index": 0})
     assert outcome.outcome == "denied"

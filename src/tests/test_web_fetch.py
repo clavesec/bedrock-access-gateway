@@ -72,6 +72,14 @@ def test_non_http_schemes_are_never_extracted():
     assert web_fetch.extract_human_urls(messages) == ["https://ok.example/"]
 
 
+def test_bracket_malformed_urls_are_skipped_not_crashed():
+    """urlsplit raises ValueError on bracket-malformed hosts; chat text like
+    a placeholder URL must never crash the request (it did pre-review)."""
+    messages = [user("Point it at http://[your-server]/admin then read https://ok.example/a")]
+    assert web_fetch.extract_human_urls(messages) == ["https://ok.example/a"]
+    assert web_fetch.extract_human_urls([user("see http://[2001:db8::1 for details")]) == []
+
+
 def test_trailing_punctuation_trimmed_but_balanced_parens_kept():
     messages = [
         user("Read https://en.wikipedia.org/wiki/Foo_(bar), then https://example.com/x."),
@@ -194,14 +202,23 @@ def test_policy_reason_allowlist_hit_and_miss(monkeypatch):
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, raw: bytes | None = None):
+    def __init__(self, status_code=200, payload=None, raw: bytes | None = None, body_exc=None):
         self.status_code = status_code
         if raw is None:
             raw = json.dumps(payload).encode()
         self._raw = raw
-        self.content = raw[:4096]
+        self._body_exc = body_exc
+
+    @property
+    def content(self):
+        # On a stream=True response .content buffers the ENTIRE body before
+        # any slicing — production code must never touch it (byte-cap
+        # bypass); every read goes through iter_content.
+        raise AssertionError("response.content is an unbounded read on stream=True")
 
     def iter_content(self, chunk_size):
+        if self._body_exc is not None:
+            raise self._body_exc
         for i in range(0, len(self._raw), chunk_size):
             yield self._raw[i : i + chunk_size]
 
@@ -303,6 +320,33 @@ def test_execute_maps_timeouts(connector):
     import requests as requests_lib
 
     connector(exc=requests_lib.exceptions.ConnectTimeout("boom"))
+    with pytest.raises(web_fetch.WebFetchError) as excinfo:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    assert excinfo.value.outcome == "timeout"
+
+
+def test_mid_body_transport_failures_map_to_webfetcherror(connector):
+    """stream=True defers body reads past post(); a reset or stall mid-body
+    must still surface as WebFetchError so the executor audits it (it
+    escaped as a raw requests exception pre-review)."""
+    import requests as requests_lib
+
+    connector(FakeResponse(payload={}, body_exc=requests_lib.exceptions.ConnectionError("reset")))
+    with pytest.raises(web_fetch.WebFetchError) as err:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    assert err.value.outcome == "error"
+
+    connector(FakeResponse(payload={}, body_exc=requests_lib.exceptions.ReadTimeout("stall")))
+    with pytest.raises(web_fetch.WebFetchError) as timeout:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    assert timeout.value.outcome == "timeout"
+
+
+def test_total_read_deadline_bounds_a_drip_feeding_connector(connector, monkeypatch):
+    """The requests read timeout is per socket read; the wall-clock deadline
+    is what actually bounds the call."""
+    monkeypatch.setattr(setting, "WEB_FETCH_CONNECTOR_TIMEOUT_S", -1)
+    connector(FakeResponse(payload={"content": "x" * 100000}))
     with pytest.raises(web_fetch.WebFetchError) as excinfo:
         web_fetch.execute_web_fetch("https://a.example", "t")
     assert excinfo.value.outcome == "timeout"

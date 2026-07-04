@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -325,37 +326,49 @@ class BedrockModel(BaseChatModel):
 
     async def _execute_tool_round(self, plan, tool_ctx, tool_uses: list[dict], fetch_allowed: bool):
         """Run one round of server-tool calls through the executor choke
-        point; returns ``[(toolUseId, ToolOutcome), ...]``.
+        point; returns ``[(toolUseId, ToolOutcome), ...]`` in request order.
 
         Every branch — including the iteration-cap deny and unexpected
-        executor failures — produces a toolResult, so the continuation
-        conversation always answers every toolUse (Converse requires it).
+        executor failures (routed through ``executor.unexpected_failure`` so
+        even a crashed call leaves an audit record) — produces a toolResult,
+        so the continuation conversation always answers every toolUse
+        (Converse requires it). Calls within a round are independent and run
+        concurrently; the per-call control order lives inside the executor.
         """
-        results = []
-        for tool_use in tool_uses:
-            self.server_tool_used = tool_use["name"]
-            if not fetch_allowed:
-                outcome = await run_in_threadpool(
-                    executor.deny_iteration_cap, plan, tool_ctx, tool_use["name"], tool_use["input"]
-                )
-            else:
-                try:
+
+        async def run_one(tool_use: dict):
+            name = tool_use["name"]
+            # The raw model-emitted name is attacker-influenceable (via
+            # fetched content); only a registered name may reach the E3
+            # access-log line.
+            self.server_tool_used = executor.loggable_tool_name(name)
+            try:
+                if not fetch_allowed:
                     outcome = await run_in_threadpool(
-                        executor.run_server_tool, plan, tool_ctx, tool_use["name"], tool_use["input"]
+                        executor.deny_iteration_cap, plan, tool_ctx, name, tool_use["input"]
                     )
-                except Exception as exc:
-                    # E3: exception class only — no URL, no content.
-                    logger.error("server tool execution failed (%s)", type(exc).__name__)
-                    outcome = executor.ToolOutcome(
-                        result_text="web_fetch failed: internal error. Answer with the information you already have.",
-                        outcome="error",
+                else:
+                    outcome = await run_in_threadpool(
+                        executor.run_server_tool, plan, tool_ctx, name, tool_use["input"]
                     )
-            results.append((tool_use["toolUseId"], outcome))
-        return results
+            except Exception as exc:
+                # E3: exception class only — no URL, no content.
+                logger.error("server tool execution failed (%s)", type(exc).__name__)
+                outcome = await run_in_threadpool(
+                    executor.unexpected_failure, plan, tool_ctx, name, tool_use["input"]
+                )
+            return (tool_use["toolUseId"], outcome)
+
+        return list(await asyncio.gather(*(run_one(tool_use) for tool_use in tool_uses)))
 
     def _append_tool_round(self, messages: list, assistant_content: list, results, model: str) -> None:
         """Append the assistant turn and its toolResults to the loop
-        conversation, with an optional cachePoint on the growing prefix (R9)."""
+        conversation, with an optional cachePoint on the growing prefix (R9).
+
+        cachePoints are pruned to Claude's four-checkpoint ceiling (oldest
+        first) — a run of WEB_FETCH_MAX_ITERATIONS+1 rounds would otherwise
+        accumulate five markers and fail Converse validation.
+        """
         messages.append({"role": "assistant", "content": assistant_content})
         content = [
             {
@@ -370,6 +383,22 @@ class BedrockModel(BaseChatModel):
         if setting.WEB_FETCH_PROMPT_CACHE and "anthropic" in model.lower():
             content.append({"cachePoint": {"type": "default"}})
         messages.append({"role": "user", "content": content})
+        self._prune_cache_points(messages)
+
+    @staticmethod
+    def _prune_cache_points(messages: list, max_points: int = 4) -> None:
+        """Drop the oldest cachePoint blocks beyond Claude's per-request
+        checkpoint limit, keeping the most recent prefixes cacheable."""
+        positions = [
+            (message_index, block_index)
+            for message_index, message in enumerate(messages)
+            if isinstance(message.get("content"), list)
+            for block_index, block in enumerate(message["content"])
+            if isinstance(block, dict) and "cachePoint" in block
+        ]
+        excess = positions[: max(0, len(positions) - max_points)]
+        for message_index, block_index in reversed(excess):
+            del messages[message_index]["content"][block_index]
 
     async def _chat_tool_loop(self, chat_request: ChatRequest, plan, tool_ctx, message_id: str) -> ChatResponse:
         """Internal Converse loop for server-side tools (non-stream).
@@ -405,10 +434,14 @@ class BedrockModel(BaseChatModel):
                     input_tokens=total_input,
                     output_tokens=total_output,
                 )
+            tool_uses = [part["toolUse"] for part in content if "toolUse" in part]
             if denied_final:
-                # The model kept calling tools after the denied round: force
-                # a text-only final. The client declared no tools, so
-                # surfacing tool_calls here would break it (loop invariant).
+                # The model kept calling tools after the denied round: audit
+                # the attempts (the WORM trail records attempts, not just
+                # executions), then force a text-only final. The client
+                # declared no tools, so surfacing tool_calls here would
+                # break it (loop invariant).
+                await self._execute_tool_round(plan, tool_ctx, tool_uses, fetch_allowed=False)
                 text = "\n".join(part["text"] for part in content if "text" in part)
                 return self._create_response(
                     model=chat_request.model,
@@ -418,7 +451,6 @@ class BedrockModel(BaseChatModel):
                     input_tokens=total_input,
                     output_tokens=total_output,
                 )
-            tool_uses = [part["toolUse"] for part in content if "toolUse" in part]
             fetch_allowed = fetch_rounds < setting.WEB_FETCH_MAX_ITERATIONS
             results = await self._execute_tool_round(plan, tool_ctx, tool_uses, fetch_allowed)
             if fetch_allowed:
@@ -446,7 +478,16 @@ class BedrockModel(BaseChatModel):
         """
         self.stream_usage = None
         self.stream_error = False
-        plan = await self._plan_server_tools(chat_request, tool_ctx)
+        try:
+            plan = await self._plan_server_tools(chat_request, tool_ctx)
+        except Exception as e:
+            # Planning failures must surface as the documented in-band SSE
+            # error on the wire-200 stream, not a severed connection. E3:
+            # the log line carries the exception class only.
+            self.stream_error = True
+            logger.error("Stream planning error for model %s (%s)", chat_request.model, type(e).__name__)
+            yield self.stream_response_to_bytes(Error(error=ErrorMessage(message=str(e))))
+            return
         if plan is not None:
             async for chunk_bytes in self._chat_stream_tool_loop(chat_request, plan, tool_ctx):
                 yield chunk_bytes
@@ -546,8 +587,10 @@ class BedrockModel(BaseChatModel):
                         delta = chunk["contentBlockDelta"]["delta"]
                         index = chunk["contentBlockDelta"]["contentBlockIndex"]
                         if "text" in delta:
-                            entry = blocks.setdefault(index, {"text": ""})
-                            entry["text"] = entry.get("text", "") + delta["text"]
+                            # List-append, joined once at round end — string
+                            # += here would be quadratic over long outputs.
+                            entry = blocks.setdefault(index, {"text_parts": []})
+                            entry.setdefault("text_parts", []).append(delta["text"])
                             yield self._stream_chunk(
                                 message_id, model, ChatResponseMessage(content=delta["text"])
                             )
@@ -579,13 +622,6 @@ class BedrockModel(BaseChatModel):
                         message_id, model, ChatResponseMessage(), finish_reason=stop_reason
                     )
                     break
-                if denied_final:
-                    # The model kept calling tools after the denied round:
-                    # end the stream cleanly (tool deltas were suppressed).
-                    yield self._stream_chunk(
-                        message_id, model, ChatResponseMessage(), finish_reason="end_turn"
-                    )
-                    break
                 assistant_content = []
                 tool_uses = []
                 for index in sorted(blocks):
@@ -604,8 +640,17 @@ class BedrockModel(BaseChatModel):
                         }
                         assistant_content.append({"toolUse": tool_use})
                         tool_uses.append(tool_use)
-                    elif entry.get("text"):
-                        assistant_content.append({"text": entry["text"]})
+                    elif entry.get("text_parts"):
+                        assistant_content.append({"text": "".join(entry["text_parts"])})
+                if denied_final:
+                    # The model kept calling tools after the denied round:
+                    # audit the attempts, then end the stream cleanly (tool
+                    # deltas were suppressed).
+                    await self._execute_tool_round(plan, tool_ctx, tool_uses, fetch_allowed=False)
+                    yield self._stream_chunk(
+                        message_id, model, ChatResponseMessage(), finish_reason="end_turn"
+                    )
+                    break
                 fetch_allowed = fetch_rounds < setting.WEB_FETCH_MAX_ITERATIONS
                 if fetch_allowed and setting.WEB_FETCH_STREAM_STATUS:
                     for tool_use in tool_uses:
@@ -638,7 +683,9 @@ class BedrockModel(BaseChatModel):
             yield self.stream_response_to_bytes()
         except Exception as e:
             self.stream_error = True
-            logger.error("Stream error for model %s: %s", model, str(e))
+            # E3: class name only — on this path exception text can embed
+            # request material (the URL-carrying toolSpec, fenced content).
+            logger.error("Stream error for model %s (%s)", model, type(e).__name__)
             error_event = Error(error=ErrorMessage(message=str(e)))
             yield self.stream_response_to_bytes(error_event)
 
