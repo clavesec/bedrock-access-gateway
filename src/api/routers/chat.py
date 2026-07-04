@@ -11,6 +11,7 @@ from api.models.bedrock import BedrockModel
 from api.schema import ChatRequest, ChatResponse, ChatStreamResponse, Error
 from api.setting import DEFAULT_MODEL
 from api.taint import capture_conversation
+from api.tools.executor import ServerToolContext
 
 router = APIRouter(
     prefix="/chat",
@@ -23,6 +24,7 @@ async def _stream_with_access_log(
     model: BedrockModel,
     chat_request: ChatRequest,
     emit: Callable[..., None],
+    tool_ctx=None,
 ) -> AsyncIterable[bytes]:
     """Pass the stream through untouched; emit the metadata line at the end.
 
@@ -33,7 +35,7 @@ async def _stream_with_access_log(
     """
     outcome = "success"
     try:
-        async for chunk in model.chat_stream(chat_request):
+        async for chunk in model.chat_stream(chat_request, tool_ctx):
             yield chunk
     except GeneratorExit:
         outcome = "aborted"
@@ -70,8 +72,25 @@ async def chat_completions(
     started = time.monotonic()
     identity = getattr(request.state, "tpai_identity", None)
 
+    # Identity/scope material for server-side tools (m2 web_fetch loop).
+    # None whenever identity enforcement is off — planning then declines and
+    # the request takes the exact pre-m2 path.
+    tool_ctx = None
+    binding = getattr(request.state, "tpai_mint_binding", None)
+    if identity and binding:
+        tool_ctx = ServerToolContext(
+            identity=identity,
+            binding=binding,
+            subject_id=getattr(request.state, "tpai_mint_subject_id", None),
+            chat_id=getattr(request.state, "tpai_chat_id", None),
+        )
+
     if chat_request.model.lower().startswith("gpt-"):
         chat_request.model = DEFAULT_MODEL
+
+    # Bound before emit's closure reads it: the except path emits even when
+    # model construction itself failed.
+    model = None
 
     def emit(*, stream: bool, status: int, outcome: str, usage=None) -> None:
         emit_access_log(
@@ -84,6 +103,7 @@ async def chat_completions(
             prompt_tokens=usage.prompt_tokens if usage else None,
             completion_tokens=usage.completion_tokens if usage else None,
             outcome=outcome,
+            tool=getattr(model, "server_tool_used", None),
         )
 
     try:
@@ -92,10 +112,10 @@ async def chat_completions(
         model.validate(chat_request)
         if chat_request.stream:
             return StreamingResponse(
-                content=_stream_with_access_log(model, chat_request, emit),
+                content=_stream_with_access_log(model, chat_request, emit, tool_ctx),
                 media_type="text/event-stream",
             )
-        response = await model.chat(chat_request)
+        response = await model.chat(chat_request, tool_ctx)
     except Exception as exc:
         emit(
             stream=bool(chat_request.stream),

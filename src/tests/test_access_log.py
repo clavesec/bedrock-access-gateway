@@ -97,7 +97,7 @@ def test_stream_emits_metadata_line_with_usage(client, caplog):
 def test_error_path_emits_metadata_line(client, caplog, monkeypatch):
     caplog.set_level(logging.DEBUG)
 
-    async def throttled(self, chat_request):
+    async def throttled(self, chat_request, tool_ctx=None):
         raise HTTPException(status_code=429, detail="Too many requests")
 
     monkeypatch.setattr(StubBedrockModel, "chat", throttled)
@@ -116,7 +116,7 @@ def test_error_path_stream_field_is_bool(client, caplog, monkeypatch):
     to False so the line's stream field never drifts from the schema."""
     caplog.set_level(logging.DEBUG)
 
-    async def broken(self, chat_request):
+    async def broken(self, chat_request, tool_ctx=None):
         raise HTTPException(status_code=500, detail="boom")
 
     monkeypatch.setattr(StubBedrockModel, "chat", broken)
@@ -137,7 +137,7 @@ def test_stream_error_recorded_in_outcome(client, caplog, monkeypatch):
     wire-status-200 response; the metadata line still says outcome=error."""
     caplog.set_level(logging.DEBUG)
 
-    async def broken_stream(self, chat_request):
+    async def broken_stream(self, chat_request, tool_ctx=None):
         self.stream_usage = None
         self.stream_error = True
         yield b'data: {"error": {"message": "stream failed"}}\n\n'
@@ -254,7 +254,7 @@ def test_no_content_in_logs_stream(client, caplog):
 def test_no_content_in_logs_on_error_path(client, caplog, monkeypatch):
     caplog.set_level(logging.DEBUG)
 
-    async def broken(self, chat_request):
+    async def broken(self, chat_request, tool_ctx=None):
         raise HTTPException(status_code=500, detail="upstream failure")
 
     monkeypatch.setattr(StubBedrockModel, "chat", broken)

@@ -30,6 +30,9 @@ class BaseChatModel(ABC):
     # failure into an in-band SSE error event.
     stream_usage = None
     stream_error = False
+    # Name of the server-side tool the request attempted (m2 web_fetch loop);
+    # the access log's E3 metadata line carries the tool name only.
+    server_tool_used = None
 
     def list_models(self) -> list[str]:
         """Return a list of supported models"""
@@ -40,12 +43,13 @@ class BaseChatModel(ABC):
         pass
 
     @abstractmethod
-    async def chat(self, chat_request: ChatRequest) -> ChatResponse:
-        """Handle a basic chat completion requests."""
+    async def chat(self, chat_request: ChatRequest, tool_ctx=None) -> ChatResponse:
+        """Handle a basic chat completion requests. ``tool_ctx`` carries the
+        request's identity/scope material for server-side tools (m2)."""
         pass
 
     @abstractmethod
-    async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
+    async def chat_stream(self, chat_request: ChatRequest, tool_ctx=None) -> AsyncIterable[bytes]:
         """Handle a basic chat completion requests with stream response."""
         pass
 
