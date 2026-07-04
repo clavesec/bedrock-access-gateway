@@ -34,8 +34,22 @@ WEB_FETCH_TIMEOUT_S = int(os.environ.get("WEB_FETCH_TIMEOUT_S", "8"))
 WEB_FETCH_MAX_BYTES = int(os.environ.get("WEB_FETCH_MAX_BYTES", str(2 * 1024 * 1024)))
 # Hard cap on extracted characters returned to the model per fetch.
 WEB_FETCH_MAX_CHARS = int(os.environ.get("WEB_FETCH_MAX_CHARS", "50000"))
-# Comma-separated domain allowlist (defense-in-depth on top of the Squid proxy).
-# Empty = allow any domain that passes the SSRF guard and the proxy allowlist.
+# Comma-separated domain allowlist, enforced gateway-side before dispatch —
+# defense-in-depth on top of the connector's URL-policy layer (which owns the
+# real decision, R5). Empty = beta allow-all: any URL from the human turn that
+# the connector's SSRF guard and policy accept.
 WEB_FETCH_ALLOWED_DOMAINS = os.environ.get("WEB_FETCH_ALLOWED_DOMAINS", "")
 # Surface a "🔎 Fetching <host>…" status line into the stream when fetching.
 WEB_FETCH_STREAM_STATUS = os.environ.get("WEB_FETCH_STREAM_STATUS", "false").lower() != "false"
+# Append a cachePoint block to the growing conversation on loop continuation
+# rounds (Claude only) so repeated context is served from the prompt cache.
+# Off until m2 Phase 2 (R9).
+WEB_FETCH_PROMPT_CACHE = os.environ.get("WEB_FETCH_PROMPT_CACHE", "false").lower() != "false"
+# Read timeout (seconds) for the gateway->connector call. Must exceed the
+# connector's own origin-fetch timeout (WEB_FETCH_TIMEOUT_S, enforced
+# connector-side) plus its quarantined-model extraction pass (R7).
+WEB_FETCH_CONNECTOR_TIMEOUT_S = int(os.environ.get("WEB_FETCH_CONNECTOR_TIMEOUT_S", "30"))
+# Base URL of the external-content connector's PrivateLink interface endpoint
+# (https://vpce-….vpce-svc-….…), injected by the bedrock-gateway-stack CDK
+# wiring since S09. Unset leaves the whole fetch path dark (fail closed).
+TPAI_CONNECTOR_URL = os.environ.get("TPAI_CONNECTOR_URL", "")

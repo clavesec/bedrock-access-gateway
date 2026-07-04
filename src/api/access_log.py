@@ -46,10 +46,10 @@ def emit_access_log(
     """Emit the per-request metadata line.
 
     ``event`` is ``chat_completion`` or ``embeddings`` (``stream`` is None
-    for the latter — not applicable). ``tool`` is always ``None`` today —
-    server-side tool execution arrives with the m1 Phase D taint rule and
-    the m2 ``web_fetch`` tool; the field exists so the schema does not
-    change when it does.
+    for the latter — not applicable). ``tool`` is the server-side tool name
+    when the request attempted one (m2 ``web_fetch``), else ``None`` — the
+    name only, never the target URL (full URLs live in the WORM audit
+    trail, ``api.audit``).
     """
     logger.info(
         json.dumps(

@@ -92,18 +92,24 @@ class StubBedrockModel:
 
     Mirrors the BaseChatModel streaming contract the access log relies on:
     chat_stream records ``stream_usage`` / ``stream_error`` on the instance.
+    ``last_tool_ctx`` (class attribute) records the ServerToolContext the
+    router passed, for the m2 plumbing assertions.
     """
 
     stream_usage = None
     stream_error = False
+    server_tool_used = None
+    last_tool_ctx = None
 
     def validate(self, chat_request):
         return None
 
-    async def chat(self, chat_request):
+    async def chat(self, chat_request, tool_ctx=None):
+        type(self).last_tool_ctx = tool_ctx
         return CANNED_RESPONSE
 
-    async def chat_stream(self, chat_request):
+    async def chat_stream(self, chat_request, tool_ctx=None):
+        type(self).last_tool_ctx = tool_ctx
         self.stream_usage = None
         self.stream_error = False
         yield b'data: {"choices":[{"delta":{"content":"Hello."}}]}\n\n'
