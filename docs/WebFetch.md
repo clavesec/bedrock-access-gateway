@@ -143,6 +143,27 @@ Content-Type: application/json
 }
 ```
 
+### Transport trust (TPAI#365)
+
+The connector serves a boot-time TLS cert signed by the **egress-local CA**
+(private to the TPAI-Egress account — org PKI is unreachable from there by
+S05 SCP design), always carrying the fixed SAN
+`external-content-connector.internal` (`CONNECTOR_TLS_SERVER_NAME`). The
+gateway's connector session — and only that session; the process default
+bundle is untouched — pins its trust to exactly that CA
+(`TPAI_CONNECTOR_CA_B64`, injected by the bedrock-gateway-stack from the
+egress stack's CFN output) and asserts the contract SAN in place of URL
+hostname matching, because the URL carries the per-endpoint PrivateLink
+DNS name, unknowable at signing time. The pinned adapter is mounted on the
+`TPAI_CONNECTOR_URL` prefix only, and the URL itself must be `https://`
+(an `http://` value is refused before any request — the JWT never rides
+cleartext). Unset/malformed/empty CA config fails closed (public-CA
+verification can never accept the egress-local cert; malformed or empty
+raises before any request). Test suite: `tests/test_web_fetch_tls.py`
+(real handshakes, trustme). Connector side of the contract: the TPAI main
+repo's `external-content-connector/entrypoint.sh` (CA-signed boot cert,
+same change-set — TPAI#365).
+
 The gateway requires only `content` (string) and treats `truncated` as
 advisory; **gateway-side caps apply regardless** (defense in depth against
 a compromised connector): response body read ≤ `WEB_FETCH_MAX_BYTES` (all
@@ -171,6 +192,7 @@ gateway's).
 | `WEB_FETCH_STREAM_STATUS` | `false` | on from Phase 2 (R9) |
 | `WEB_FETCH_PROMPT_CACHE` | `false` | on from Phase 2 (R9), Claude only |
 | `TPAI_CONNECTOR_URL` | empty | injected by CDK (S09); empty = fail closed |
+| `TPAI_CONNECTOR_CA_B64` | empty | b64 PEM/DER of the egress-local CA (TPAI#365); set = connector session pins exactly this CA + asserts the contract SAN; empty = default public-CA verify (fails the egress-local cert — closed) |
 
 ## Logging (E3)
 
