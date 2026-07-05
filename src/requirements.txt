@@ -4,6 +4,12 @@ uvicorn==0.29.0
 mangum==0.17.0
 tiktoken==0.6.0
 requests==2.32.4
+# Pinned because the connector CA pin (web_fetch._ConnectorTlsAdapter,
+# TPAI#365) relies on urllib3's assert_hostname pool kwarg and on
+# requests-2.32 internals; the TLS test suite proves the pair works, so the
+# image must resolve the same urllib3 the suite ran against — a silent major
+# bump could drop assert_hostname and skip SAN verification entirely.
+urllib3==2.5.0
 numpy==1.26.4
 # The pinned botocore's bedrock-runtime service model must include the
 # Converse `cachePoint` ContentBlock (R9 prompt-cache) — an older model

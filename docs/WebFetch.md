@@ -154,10 +154,15 @@ bundle is untouched — pins its trust to exactly that CA
 (`TPAI_CONNECTOR_CA_B64`, injected by the bedrock-gateway-stack from the
 egress stack's CFN output) and asserts the contract SAN in place of URL
 hostname matching, because the URL carries the per-endpoint PrivateLink
-DNS name, unknowable at signing time. Unset/malformed CA config fails
-closed (public-CA verification can never accept the egress-local cert;
-malformed raises before any request). Test suite:
-`tests/test_web_fetch_tls.py` (real handshakes, trustme).
+DNS name, unknowable at signing time. The pinned adapter is mounted on the
+`TPAI_CONNECTOR_URL` prefix only, and the URL itself must be `https://`
+(an `http://` value is refused before any request — the JWT never rides
+cleartext). Unset/malformed/empty CA config fails closed (public-CA
+verification can never accept the egress-local cert; malformed or empty
+raises before any request). Test suite: `tests/test_web_fetch_tls.py`
+(real handshakes, trustme). Connector side of the contract: the TPAI main
+repo's `external-content-connector/entrypoint.sh` (CA-signed boot cert,
+same change-set — TPAI#365).
 
 The gateway requires only `content` (string) and treats `truncated` as
 advisory; **gateway-side caps apply regardless** (defense in depth against
