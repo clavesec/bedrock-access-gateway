@@ -53,3 +53,12 @@ WEB_FETCH_CONNECTOR_TIMEOUT_S = int(os.environ.get("WEB_FETCH_CONNECTOR_TIMEOUT_
 # (https://vpce-….vpce-svc-….…), injected by the bedrock-gateway-stack CDK
 # wiring since S09. Unset leaves the whole fetch path dark (fail closed).
 TPAI_CONNECTOR_URL = os.environ.get("TPAI_CONNECTOR_URL", "")
+# base64 of the egress-local CA certificate (PEM — a multi-cert rotation
+# bundle is accepted — or a single DER cert) that signs the connector's
+# boot-time TLS certs (TPAI#365). Set: the connector HTTP session trusts
+# EXACTLY this CA and asserts the fixed connector SAN (web_fetch.py
+# CONNECTOR_TLS_SERVER_NAME) instead of the URL hostname. Unset: the session
+# keeps default public-CA verification (which the connector's egress-local
+# cert can never satisfy — fail closed). Injected by the bedrock-gateway-stack
+# CDK wiring; only the connector session reads it, never the default bundle.
+TPAI_CONNECTOR_CA_B64 = os.environ.get("TPAI_CONNECTOR_CA_B64", "")

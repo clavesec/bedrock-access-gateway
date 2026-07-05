@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest==8.3.4
 httpx==0.27.2
+# TLS-pinning tests (test_web_fetch_tls.py, TPAI#365): issues throwaway
+# CA/leaf certs for real gateway->connector handshake assertions.
+trustme==1.2.1

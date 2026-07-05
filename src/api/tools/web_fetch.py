@@ -42,16 +42,20 @@ Dark today: ``ENABLE_WEB_FETCH_TOOL`` defaults off, and without it nothing
 imports a fetchable URL list into any request.
 """
 
+import base64
+import binascii
 import json
 import logging
 import re
 import secrets
+import ssl
 import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from api import setting
 from api.schema import TextContent, UserMessage
@@ -71,6 +75,13 @@ MAX_URLS = 32
 # Connect timeout for the gateway->connector hop (in-VPC PrivateLink; a slow
 # TCP connect means the endpoint is broken, not busy).
 CONNECT_TIMEOUT_S = 3
+
+# Fixed SAN every connector boot cert carries (wire contract, TPAI#365 —
+# the connector's entrypoint bakes it into each CA-signed cert). The URL
+# addresses the per-endpoint PrivateLink DNS name, which the egress account
+# cannot know at signing time, so the pinned session asserts this stable
+# name against the presented cert instead of the URL hostname.
+CONNECTOR_TLS_SERVER_NAME = "external-content-connector.internal"
 
 _URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.IGNORECASE)
 # Punctuation that is almost always prose trailing the URL, not part of it.
@@ -114,6 +125,84 @@ class FetchResult:
     truncated: bool
 
 
+def _connector_ca_data() -> str | bytes:
+    """Decode ``TPAI_CONNECTOR_CA_B64`` into ``ssl`` ``cadata``.
+
+    Accepts base64 of a PEM certificate (or multi-cert PEM bundle, the
+    rotation-overlap shape) or of a single DER certificate. Anything
+    unparseable raises ``WebFetchError`` — a gateway configured for CA
+    pinning must never silently fall back to public-CA trust.
+    """
+    try:
+        decoded = base64.b64decode(setting.TPAI_CONNECTOR_CA_B64.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise WebFetchError(
+            "TPAI_CONNECTOR_CA_B64 is not valid base64 - refusing to execute web_fetch"
+        ) from exc
+    if b"-----BEGIN CERTIFICATE-----" in decoded:
+        try:
+            # str cadata = PEM (ssl treats bytes cadata as DER).
+            return decoded.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise WebFetchError(
+                "TPAI_CONNECTOR_CA_B64 PEM payload is not ASCII - refusing to execute web_fetch"
+            ) from exc
+    return decoded
+
+
+class _ConnectorTlsAdapter(HTTPAdapter):
+    """Transport adapter pinning the connector session's TLS trust (TPAI#365).
+
+    The connector serves a boot-time cert signed by the egress-local CA
+    (private to the TPAI-Egress account), so this adapter (a) verifies the
+    chain against EXACTLY that CA — never the public bundle — and (b) has
+    urllib3 assert the fixed contract SAN ``CONNECTOR_TLS_SERVER_NAME``
+    in place of URL-hostname matching (the VPCE DNS name the URL carries
+    is unknowable at signing time).
+    """
+
+    def __init__(self, cadata: str | bytes):
+        try:
+            # create_default_context with cadata loads ONLY that CA (no
+            # load_default_certs call) — the pin is the whole trust store.
+            self._ssl_context = ssl.create_default_context(cadata=cadata)
+        except ssl.SSLError as exc:
+            raise WebFetchError(
+                "TPAI_CONNECTOR_CA_B64 does not contain a loadable CA certificate - refusing to execute web_fetch"
+            ) from exc
+        # Hostname is asserted by urllib3 against the contract SAN below;
+        # the context-level check would compare against the URL host.
+        self._ssl_context.check_hostname = False
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+        kwargs["ssl_context"] = self._ssl_context
+        kwargs["assert_hostname"] = CONNECTOR_TLS_SERVER_NAME
+        return super().init_poolmanager(connections, maxsize, block=block, **kwargs)
+
+    # The two overrides below are both required to keep the pin airtight on
+    # requests>=2.32: each neutralizes a distinct path by which requests
+    # pushes the public certifi bundle into the pool as ca_certs — and
+    # urllib3 loads ca_certs INTO a provided ssl_context, silently widening
+    # the pin back to every public CA. The context built in __init__ is the
+    # entire trust decision (verify_mode stays CERT_REQUIRED from
+    # create_default_context); the tls-pinning test suite asserts the trust
+    # store still holds exactly the pinned CA(s) after a live request.
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        # Path 1: requests>=2.32 derives per-request TLS pool attributes
+        # (_urllib3_request_context) from `verify`. Resolve the pool from
+        # the connection_pool_kw set in init_poolmanager instead — safe here
+        # because this session never uses proxies (trust_env=False, none
+        # configured) or client certs.
+        return self.poolmanager.connection_from_url(request.url)
+
+    def cert_verify(self, conn, url, verify, cert):
+        # Path 2 (and the whole path on requests<2.32): the default
+        # implementation assigns the certifi bundle to conn.ca_certs.
+        pass
+
+
 def _session() -> requests.Session:
     """Lazy singleton HTTP session (connection reuse across loop rounds;
     nothing AWS-flavored is resolved at import for this dark path)."""
@@ -128,6 +217,12 @@ def _session() -> requests.Session:
             # The gateway task has no proxy and no route beyond the VPC; a
             # trust_env proxy var must never redirect connector traffic.
             session.trust_env = False
+            if setting.TPAI_CONNECTOR_CA_B64:
+                # Egress-local CA pinning (TPAI#365). This session talks to
+                # the connector ONLY, so mounting on the https:// prefix
+                # cannot affect any other traffic; the process default
+                # bundle is untouched.
+                session.mount("https://", _ConnectorTlsAdapter(_connector_ca_data()))
             _http_session = session
         return _http_session
 
