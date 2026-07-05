@@ -6,7 +6,6 @@ import re
 import time
 from abc import ABC
 from typing import AsyncIterable, Iterable, Literal
-from urllib.parse import urlsplit
 
 import boto3
 import numpy as np
@@ -53,7 +52,7 @@ from api.setting import (
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_TIKTOKEN_DECODING,
 )
-from api.tools import executor, web_fetch
+from api.tools import executor
 
 logger = logging.getLogger(__name__)
 
@@ -654,13 +653,14 @@ class BedrockModel(BaseChatModel):
                 fetch_allowed = fetch_rounds < setting.WEB_FETCH_MAX_ITERATIONS
                 if fetch_allowed and setting.WEB_FETCH_STREAM_STATUS:
                     for tool_use in tool_uses:
-                        url = web_fetch.resolve_url(plan.urls, tool_use["input"])
-                        if url:
-                            host = urlsplit(url).hostname or ""
+                        status = executor.stream_status_text(
+                            plan, tool_use["name"], tool_use["input"]
+                        )
+                        if status:
                             yield self._stream_chunk(
                                 message_id,
                                 model,
-                                ChatResponseMessage(content=f"\n\n🔎 Fetching {host}…\n\n"),
+                                ChatResponseMessage(content=f"\n\n{status}\n\n"),
                             )
                 results = await self._execute_tool_round(plan, tool_ctx, tool_uses, fetch_allowed)
                 if fetch_allowed:

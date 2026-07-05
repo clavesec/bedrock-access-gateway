@@ -303,20 +303,28 @@ def test_unregistered_tool_name_fails_closed(recorder, plan):
     assert recorder.fetches == []
 
 
-def test_registered_tool_without_a_handler_fails_loudly(recorder, plan):
-    """gmail_search is taint-classified (m3) but has no execution handler in
-    this build — it must raise at the enforcement point, never be misrouted
-    through the web_fetch pipeline as an invalid-url-index deny."""
-    gmail_plan = executor.ServerToolPlan(
+def test_registered_tool_without_a_handler_fails_loudly(recorder, plan, monkeypatch):
+    """A taint-classified tool with no execution handler in this build must
+    raise at the enforcement point, never be misrouted through another
+    tool's pipeline as an invalid-input deny. (gmail gained its handler in
+    m3 G3, so the seam is exercised with a hypothetical future tool.)"""
+    monkeypatch.setitem(taint.TOOL_CLASSES, "future_tool", taint.INBOUND_PRIVATE)
+    future_plan = executor.ServerToolPlan(
         tool_config=plan.tool_config,
         urls=plan.urls,
         scope=plan.scope,
-        injected=["gmail_search"],
+        injected=["future_tool"],
         dropped=[],
     )
     with pytest.raises(ValueError, match="no executor handler"):
-        executor.run_server_tool(gmail_plan, CTX, "gmail_search", {"query": "x"})
+        executor.run_server_tool(future_plan, CTX, "future_tool", {"query": "x"})
     assert recorder.fetches == []
+
+
+def test_every_handler_key_is_taint_classified():
+    """The dispatch table must stay a subset of taint.TOOL_CLASSES — a
+    handler for an unclassified tool would bypass the taint rule."""
+    assert set(executor._HANDLERS) <= set(taint.TOOL_CLASSES)
 
 
 def test_taint_dropped_deny_records_the_full_url(recorder, plan):

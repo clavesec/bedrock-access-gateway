@@ -528,3 +528,230 @@ def test_router_passes_tool_ctx_and_logs_tool_name(client, monkeypatch):
     assert ctx.binding == mint.BINDING_OWUI_SESSION
     assert ctx.subject_id == "user-42"
     assert ctx.chat_id == "chat-42"
+
+
+# ----------------------------------------------- m3 G3: gmail tools in the loop
+#
+# The taint state machine runs REAL (api.taint over the DynamoDB fake) so
+# these are the loop-level "e2e both directions" checks the m3 plan
+# requires: a web turn drops/denies gmail and vice versa, driven through
+# the actual Converse loop, executor, and conditional-write semantics.
+
+
+def named_tool_use(name, tool_input, tool_use_id="tu-1", text="Working on it."):
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"text": text},
+                    {
+                        "toolUse": {
+                            "toolUseId": tool_use_id,
+                            "name": name,
+                            "input": tool_input,
+                        }
+                    },
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 10, "outputTokens": 5},
+    }
+
+
+@pytest.fixture
+def gmail_controls(monkeypatch):
+    """Both tool families enabled; REAL taint over the DynamoDB fake;
+    budgets/mint/audit stubbed; both transports stubbed."""
+    from tests.ddb_fake import FakeDynamoDB
+
+    from api.tools import base as tools_base
+    from api.tools import gmail
+
+    state = {"records": [], "fetches": [], "searches": [], "gets": [], "budget_exc": None}
+    monkeypatch.setattr(setting, "ENABLE_WEB_FETCH_TOOL", True)
+    monkeypatch.setattr(setting, "ENABLE_GMAIL_TOOLS", True)
+    monkeypatch.setattr(setting, "WEB_FETCH_ALLOWED_DOMAINS", "")
+    fake_ddb = FakeDynamoDB()
+    monkeypatch.setattr(taint, "_ddb", lambda: fake_ddb)
+    monkeypatch.setattr(taint, "TAINT_TABLE", "TPAI-TEST-gateway-taint")
+
+    def check_budget(identity, scope):
+        if state["budget_exc"]:
+            raise state["budget_exc"]
+
+    monkeypatch.setattr(budget, "check_and_consume", check_budget)
+    monkeypatch.setattr(
+        mint,
+        "get_connector_token",
+        lambda identity, binding, subject_id: mint.MintedToken(
+            token="jwt", expires_at=2**31, subject_id=subject_id
+        ),
+    )
+    monkeypatch.setattr(
+        audit, "emit_audit_record", lambda **kwargs: state["records"].append(kwargs)
+    )
+
+    def fetch(url, token):
+        state["fetches"].append(url)
+        return web_fetch.FetchResult(text="PAGE TEXT", url=url, bytes_returned=9, truncated=False)
+
+    def search(ctx, target, token):
+        state["searches"].append(target)
+        return tools_base.ToolResult(
+            text='{"messages": [], "result_count": 0}',
+            source="the user's Gmail inbox index",
+            bytes_returned=30,
+            truncated=False,
+        )
+
+    def get(ctx, target, token):
+        state["gets"].append(target)
+        return tools_base.ToolResult(
+            text='{"subject": "hi"}',
+            source=f"the user's Gmail message {target}",
+            bytes_returned=17,
+            truncated=False,
+        )
+
+    monkeypatch.setattr(web_fetch, "execute_web_fetch", fetch)
+    monkeypatch.setattr(gmail, "execute_search", search)
+    monkeypatch.setattr(gmail, "execute_get", get)
+    return state
+
+
+def test_gmail_search_loop_executes_and_fences(monkeypatch, gmail_controls):
+    """No human-turn URL -> only the gmail pair is injected; the search
+    result comes back fenced; the loop ends on the model's final text."""
+    fake = install_runtime(
+        monkeypatch,
+        FakeBedrockRuntime(
+            responses=[named_tool_use("gmail_search", {"query": "budget"}), final_response()]
+        ),
+    )
+    request = chat_request(messages=[{"role": "user", "content": "any email about budget?"}])
+    response = run(BedrockModel().chat(request, CTX))
+    injected = [t["toolSpec"]["name"] for t in fake.calls[0]["toolConfig"]["tools"]]
+    assert injected == ["gmail_search", "gmail_get_message"]
+    assert gmail_controls["searches"] == ["query:budget"]
+    tool_result = fake.calls[1]["messages"][-1]["content"][0]["toolResult"]
+    assert "TPAI-EXTERNAL-CONTENT" in tool_result["content"][0]["text"]
+    assert response.choices[0].message.content == "Here is the summary."
+    record = gmail_controls["records"][0]
+    assert (record["tool"], record["outcome"]) == ("gmail_search", "success")
+
+
+def test_web_then_gmail_blocked_in_the_loop(monkeypatch, gmail_controls):
+    """Trifecta e2e, direction 1: after a web_fetch executes, a gmail call
+    in the SAME plan is denied by the authoritative conditional write."""
+    fake = install_runtime(
+        monkeypatch,
+        FakeBedrockRuntime(
+            responses=[
+                named_tool_use("web_fetch", {"url_index": 0}),
+                named_tool_use("gmail_search", {"query": "budget"}, tool_use_id="tu-2"),
+                final_response(),
+            ]
+        ),
+    )
+    response = run(BedrockModel().chat(chat_request(), CTX))
+    assert gmail_controls["fetches"] == ["https://a.example/1"]
+    assert gmail_controls["searches"] == []  # never executed
+    reasons = [(r["tool"], r["policy_reason"], r["outcome"]) for r in gmail_controls["records"]]
+    assert ("web_fetch", "beta-allow-all", "success") in reasons
+    assert ("gmail_search", "taint-blocked", "denied") in reasons
+    denied_result = fake.calls[2]["messages"][-1]["content"][0]["toolResult"]
+    assert "not available in this conversation" in denied_result["content"][0]["text"]
+    assert response.choices[0].message.content == "Here is the summary."
+
+
+def test_gmail_then_web_blocked_in_the_loop(monkeypatch, gmail_controls):
+    """Trifecta e2e, direction 2 — and the NEXT request in the tainted
+    conversation no longer offers web_fetch at all (advisory filter)."""
+    fake = install_runtime(
+        monkeypatch,
+        FakeBedrockRuntime(
+            responses=[
+                named_tool_use("gmail_get_message", {"message_id": "msg-1"}),
+                named_tool_use("web_fetch", {"url_index": 0}, tool_use_id="tu-2"),
+                final_response(),
+            ]
+        ),
+    )
+    run(BedrockModel().chat(chat_request(), CTX))
+    assert gmail_controls["gets"] == ["msg-1"]
+    assert gmail_controls["fetches"] == []
+    reasons = [(r["tool"], r["policy_reason"], r["outcome"]) for r in gmail_controls["records"]]
+    assert ("gmail_get_message", "own-mailbox", "success") in reasons
+    assert ("web_fetch", "taint-blocked", "denied") in reasons
+
+    # A fresh request in the same (now gmail-tainted) conversation: the
+    # plan's toolConfig must not offer web_fetch at all.
+    fake2 = install_runtime(monkeypatch, FakeBedrockRuntime(responses=[final_response()]))
+    run(BedrockModel().chat(chat_request(), CTX))
+    injected = [t["toolSpec"]["name"] for t in fake2.calls[0]["toolConfig"]["tools"]]
+    assert injected == ["gmail_search", "gmail_get_message"]
+
+
+def test_gmail_budget_exhaustion_is_a_clean_toolresult(monkeypatch, gmail_controls):
+    """Budget e2e at the loop level: the deny becomes an in-band toolResult
+    error and the request still completes with the model's final text."""
+    gmail_controls["budget_exc"] = budget.BudgetExceededError("user-day", 512)
+    fake = install_runtime(
+        monkeypatch,
+        FakeBedrockRuntime(
+            responses=[named_tool_use("gmail_search", {"query": "x"}), final_response()]
+        ),
+    )
+    request = chat_request(messages=[{"role": "user", "content": "check my email"}])
+    response = run(BedrockModel().chat(request, CTX))
+    assert gmail_controls["searches"] == []
+    record = gmail_controls["records"][0]
+    assert (record["policy_reason"], record["outcome"]) == ("budget-exhausted", "denied")
+    denied_result = fake.calls[1]["messages"][-1]["content"][0]["toolResult"]
+    assert "budget is exhausted" in denied_result["content"][0]["text"]
+    assert response.choices[0].message.content == "Here is the summary."
+
+
+def test_gmail_stream_status_lines(monkeypatch, gmail_controls):
+    """WEB_FETCH_STREAM_STATUS surfaces the gmail status lines too."""
+    monkeypatch.setattr(setting, "WEB_FETCH_STREAM_STATUS", True)
+    stream_rounds = [
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockStart": {
+                    "start": {"toolUse": {"toolUseId": "tu-1", "name": "gmail_search"}},
+                    "contentBlockIndex": 0,
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "delta": {"toolUse": {"input": '{"query": "budget"}'}},
+                    "contentBlockIndex": 0,
+                }
+            },
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 5}}},
+        ],
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "delta": {"text": "Done."},
+                    "contentBlockIndex": 0,
+                }
+            },
+            {"messageStop": {"stopReason": "end_turn"}},
+            {"metadata": {"usage": {"inputTokens": 12, "outputTokens": 3}}},
+        ],
+    ]
+    install_runtime(monkeypatch, FakeBedrockRuntime(stream_rounds=stream_rounds))
+    request = chat_request(
+        messages=[{"role": "user", "content": "any email about budget?"}], stream=True
+    )
+    joined = "".join(collect_stream(BedrockModel().chat_stream(request, CTX)))
+    assert "Searching Gmail" in joined
+    assert "tool_calls" not in joined
+    assert gmail_controls["searches"] == ["query:budget"]
