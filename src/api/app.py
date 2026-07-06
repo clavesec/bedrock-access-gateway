@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from mangum import Mangum
 
-from api.routers import chat, embeddings, model
+from api.routers import chat, connectors, embeddings, model
 from api.setting import API_ROUTE_PREFIX, DESCRIPTION, SUMMARY, TITLE, VERSION
 
 config = {
@@ -41,6 +41,7 @@ app.add_middleware(
 app.include_router(model.router, prefix=API_ROUTE_PREFIX)
 app.include_router(chat.router, prefix=API_ROUTE_PREFIX)
 app.include_router(embeddings.router, prefix=API_ROUTE_PREFIX)
+app.include_router(connectors.router, prefix=API_ROUTE_PREFIX)
 
 
 @app.on_event("startup")

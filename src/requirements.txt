@@ -17,3 +17,8 @@ numpy==1.26.4
 # failed" (clavesec/TPAI#364). Verified present in 1.43.40 before pinning.
 boto3==1.43.40
 botocore==1.43.40
+# gmail_search decrypts the S15 metadata index locally (AES-256-GCM under
+# the per-identity DEK, m3 G3). Pinned to the connector's cryptography
+# version so both sides of the envelope contract resolve the same
+# implementation.
+cryptography==49.0.0

@@ -53,6 +53,37 @@ WEB_FETCH_CONNECTOR_TIMEOUT_S = int(os.environ.get("WEB_FETCH_CONNECTOR_TIMEOUT_
 # (https://vpce-….vpce-svc-….…), injected by the bedrock-gateway-stack CDK
 # wiring since S09. Unset leaves the whole fetch path dark (fail closed).
 TPAI_CONNECTOR_URL = os.environ.get("TPAI_CONNECTOR_URL", "")
+# --- Built-in gmail tools (m3 G3) ----------------------------------------------
+# Master switch for the server-side gmail_search / gmail_get_message tools AND
+# the /connectors/gmail passthrough surface OWUI's Settings → Connectors page
+# uses. Default OFF: the gateway behaves identically to before until the
+# connector's gmail adapter (S14) and metadata layer (S15) are enabled.
+ENABLE_GMAIL_TOOLS = os.environ.get("ENABLE_GMAIL_TOOLS", "false").lower() != "false"
+# When false, gmail tools are only injected for Anthropic (Claude) models —
+# same convention as WEB_FETCH_MODELS_ALL.
+GMAIL_MODELS_ALL = os.environ.get("GMAIL_MODELS_ALL", "false").lower() != "false"
+# Max index records a single gmail_search returns to the model.
+GMAIL_SEARCH_MAX_RESULTS = int(os.environ.get("GMAIL_SEARCH_MAX_RESULTS", "20"))
+# Hard cap on typed-output characters returned to the model per gmail call.
+GMAIL_MAX_CHARS = int(os.environ.get("GMAIL_MAX_CHARS", "50000"))
+# Read timeout (seconds) for gateway->connector gmail calls. Must exceed the
+# connector's Gmail-API timeout plus its quarantined-model pass (R3).
+GMAIL_CONNECTOR_TIMEOUT_S = int(os.environ.get("GMAIL_CONNECTOR_TIMEOUT_S", "30"))
+# Hard cap on bytes read from a connector gmail response (default 2 MiB).
+GMAIL_CONNECTOR_MAX_BYTES = int(os.environ.get("GMAIL_CONNECTOR_MAX_BYTES", str(2 * 1024 * 1024)))
+# Hard cap on the encrypted metadata-index object read from S3 (default 1 MiB
+# — the index is ≤200 header records, so anything near this is corrupt).
+GMAIL_INDEX_MAX_BYTES = int(os.environ.get("GMAIL_INDEX_MAX_BYTES", str(1024 * 1024)))
+# Per-identity DEK cache TTL (seconds). S15 R-5: MUST stay ≤ minutes — the
+# metadata-key 403 is the revocation signal, and a cached DEK is the longest
+# a revoked identity's index stays readable to the gateway.
+GMAIL_DEK_CACHE_TTL_S = int(os.environ.get("GMAIL_DEK_CACHE_TTL_S", "120"))
+# The S15 gmail metadata bucket (tpai-gmail-metadata-<env>-<acct>), injected
+# by the bedrock-gateway-stack CDK wiring together with the read grants.
+# Unset leaves gmail_search dark (fail closed); the connector's metadata-key
+# response is verified against this value before any S3 read.
+TPAI_GMAIL_METADATA_BUCKET = os.environ.get("TPAI_GMAIL_METADATA_BUCKET", "")
+
 # base64 of the egress-local CA certificate (PEM — a multi-cert rotation
 # bundle is accepted — or a single DER cert) that signs the connector's
 # boot-time TLS certs (TPAI#365). Set: the connector HTTP session trusts
