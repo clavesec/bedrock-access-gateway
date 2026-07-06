@@ -69,11 +69,14 @@ def encrypted_index(dek=DEK, identity=IDENTITY, records=RECORDS, truncated=False
 
 
 class FakeResponse:
-    def __init__(self, status_code, body):
+    def __init__(self, status_code, body, raise_mid_body=None):
         self.status_code = status_code
         self._body = json.dumps(body).encode("utf-8")
+        self._raise_mid_body = raise_mid_body
 
     def iter_content(self, chunk_size=65536):
+        if self._raise_mid_body is not None:
+            raise self._raise_mid_body
         yield self._body
 
     def close(self):
@@ -162,10 +165,18 @@ def gmail_env(monkeypatch):
 # ------------------------------------------------------- target resolution
 
 
-def test_resolve_search_target_accepts_query_and_optional_max_results():
+def test_resolve_search_target_accepts_query():
     assert gmail.resolve_search_target(None, {"query": "budget"}) == "query:budget"
     assert gmail.resolve_search_target(None, {"query": ""}) == "query:"
-    assert gmail.resolve_search_target(None, {"query": "a", "max_results": 3}) == "query:a"
+
+
+def test_search_tool_spec_does_not_advertise_max_results():
+    # The ToolHandler contract funnels resolve->execute through one target
+    # string, so a per-call max_results could not survive the hop — the spec
+    # must not advertise a knob the executor structurally drops.
+    props = gmail.build_search_tool_spec([])["toolSpec"]["inputSchema"]["json"]["properties"]
+    assert "max_results" not in props
+    assert set(props) == {"query"}
 
 
 @pytest.mark.parametrize(
@@ -175,9 +186,6 @@ def test_resolve_search_target_accepts_query_and_optional_max_results():
         {},
         {"query": 42},
         {"query": "x" * (gmail.MAX_QUERY_CHARS + 1)},
-        {"query": "ok", "max_results": 0},
-        {"query": "ok", "max_results": True},
-        {"query": "ok", "max_results": "5"},
     ],
 )
 def test_resolve_search_target_rejects_malformed_input(tool_input):
@@ -377,12 +385,34 @@ def test_get_message_returns_typed_output(session):
     assert payload == {"schema": gmail.GET_REQUEST_SCHEMA, "message_id": "msg-alpha"}
 
 
-def test_get_message_char_cap_truncates(session, monkeypatch):
-    monkeypatch.setattr(setting, "GMAIL_MAX_CHARS", 32)
-    session.queue("/v1/gmail/get", FakeResponse(200, message_body()))
+def test_get_message_char_cap_truncates_to_valid_json(session, monkeypatch):
+    # A cap below headers+body must shrink body_text and re-serialize — NEVER
+    # slice the JSON string mid-structure (that hands the model malformed
+    # JSON). Cap chosen above the header envelope, below headers+body.
+    monkeypatch.setattr(setting, "GMAIL_MAX_CHARS", 1000)
+    session.queue(
+        "/v1/gmail/get",
+        FakeResponse(200, message_body(body_text="x" * 5000)),
+    )
     result = gmail.execute_get(CTX, "msg-alpha", "jwt")
-    assert len(result.text) == 32
+    assert len(result.text) <= 1000
     assert result.truncated is True
+    # Still parseable JSON with the headers intact and the body shrunk.
+    parsed = json.loads(result.text)
+    assert parsed["subject"] == "Quarterly budget review"
+    assert 0 < len(parsed["body_text"]) < 5000
+
+
+def test_search_over_char_cap_drops_records_keeping_valid_json(session, s3, monkeypatch):
+    session.queue("/v1/gmail/metadata-key", FakeResponse(200, metadata_key_body()))
+    # Cap between the one-record and two-record document sizes: the second
+    # record is dropped whole, and the result stays valid JSON.
+    monkeypatch.setattr(setting, "GMAIL_MAX_CHARS", 300)
+    result = gmail.execute_search(CTX, "query:", "jwt")
+    parsed = json.loads(result.text)  # never mid-structure garbage
+    assert parsed["truncated"] is True
+    assert parsed["result_count"] == len(parsed["messages"])
+    assert len(parsed["messages"]) < 2  # at least one record dropped to fit
 
 
 def test_get_message_reconnect_required_is_a_clean_deny(session):
@@ -397,6 +427,32 @@ def test_get_message_5xx_maps_to_execution_error(session):
     session.queue("/v1/gmail/get", FakeResponse(502, {"detail": "quarantine-failed"}))
     with pytest.raises(gmail.GmailToolError):
         gmail.execute_get(CTX, "msg-alpha", "jwt")
+
+
+def test_get_message_mid_body_transport_error_maps_to_tool_error(session):
+    # A raw requests exception during the streamed body read must be mapped
+    # to GmailToolError (a bare requests exception would bypass the executor's
+    # audit branch — the guarantee web_fetch documents, shared via base).
+    import requests
+
+    session.queue(
+        "/v1/gmail/get",
+        FakeResponse(200, {}, raise_mid_body=requests.exceptions.ConnectionError("reset")),
+    )
+    with pytest.raises(gmail.GmailToolError):
+        gmail.execute_get(CTX, "msg-alpha", "jwt")
+
+
+def test_get_message_mid_body_timeout_maps_to_timeout_outcome(session):
+    import requests
+
+    session.queue(
+        "/v1/gmail/get",
+        FakeResponse(200, {}, raise_mid_body=requests.exceptions.Timeout("slow")),
+    )
+    with pytest.raises(gmail.GmailToolError) as exc_info:
+        gmail.execute_get(CTX, "msg-alpha", "jwt")
+    assert exc_info.value.outcome == "timeout"
 
 
 def test_get_message_unexpected_schema_fails_closed(session):

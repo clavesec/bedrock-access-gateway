@@ -157,13 +157,29 @@ def read_capped_json(response, *, max_bytes: int, timeout_s: int, error=ToolExec
     deadline = time.monotonic() + timeout_s
     chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_content(chunk_size=65536):
-        if time.monotonic() > deadline:
-            raise error("connector response exceeded the total read deadline", outcome="timeout")
-        total += len(chunk)
-        if total > max_bytes:
-            raise error("connector response exceeds the byte cap")
-        chunks.append(chunk)
+    # The body is read here (stream=True defers it past the caller's post/
+    # request), so a transport failure MID-BODY raises a raw requests
+    # exception during iteration. Map it to the caller's ToolExecutionError
+    # subclass at this shared choke point — an escaping raw exception would
+    # bypass the executor's audit branch entirely (the same guarantee
+    # web_fetch's execute path documents; every connector reader routes
+    # through here, so the mapping lives here once).
+    try:
+        for chunk in response.iter_content(chunk_size=65536):
+            if time.monotonic() > deadline:
+                raise error("connector response exceeded the total read deadline", outcome="timeout")
+            total += len(chunk)
+            if total > max_bytes:
+                raise error("connector response exceeds the byte cap")
+            chunks.append(chunk)
+    except error:
+        # The deadline/byte-cap raises above are already the caller's type —
+        # let them through rather than re-wrapping as a generic read failure.
+        raise
+    except requests.exceptions.Timeout as exc:
+        raise error("connector response body read timed out", outcome="timeout") from exc
+    except requests.exceptions.RequestException as exc:
+        raise error("connector response body read failed") from exc
     try:
         payload = json.loads(b"".join(chunks))
     except ValueError as exc:

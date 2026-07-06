@@ -157,14 +157,10 @@ def build_search_tool_spec(_urls: list[str]) -> dict:
                             "description": (
                                 "Words to match (case-insensitive, all must "
                                 "match) against from/to/cc/subject/date. "
-                                "Empty string lists the most recent messages."
+                                "Empty string lists the most recent messages. "
+                                "Returns up to the most recent "
+                                f"{setting.GMAIL_SEARCH_MAX_RESULTS} matches."
                             ),
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": setting.GMAIL_SEARCH_MAX_RESULTS,
-                            "description": "Cap on returned messages.",
                         },
                     },
                     "required": ["query"],
@@ -207,16 +203,18 @@ def build_get_tool_spec(_urls: list[str]) -> dict:
 
 def resolve_search_target(_plan, tool_input) -> str | None:
     """Audit target for a search call: ``query:<text>`` (R11 — the target
-    field records what was asked of the layer). None for malformed input."""
+    field records what was asked of the layer). None for malformed input.
+
+    The result count is a fixed server cap (``GMAIL_SEARCH_MAX_RESULTS``):
+    the ToolHandler contract funnels resolve→execute through this single
+    audit-target string, so a per-call ``max_results`` could not survive the
+    hop — rather than advertise a knob the executor structurally drops, the
+    tool spec omits it (a model-controlled limit would need a richer
+    ToolHandler target, a deliberate future change)."""
     if not isinstance(tool_input, dict):
         return None
     query = tool_input.get("query")
     if not isinstance(query, str) or len(query) > MAX_QUERY_CHARS:
-        return None
-    max_results = tool_input.get("max_results", None)
-    if max_results is not None and (
-        isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1
-    ):
         return None
     return f"query:{query}"
 
@@ -325,8 +323,12 @@ def _fetch_dek(identity: str, token: str) -> bytes:
     now = time.monotonic()
     with _dek_lock:
         cached = _dek_cache.get(identity)
-        if cached is not None and now < cached[1]:
-            return cached[0]
+        if cached is not None:
+            if now < cached[1]:
+                return cached[0]
+            # Expired: evict now rather than retain plaintext key material
+            # past its TTL (S15 R-5 keeps the cache ≤ minutes).
+            del _dek_cache[identity]
 
     response = _request("GET", "/v1/gmail/metadata-key", token)
     with response:
@@ -459,17 +461,27 @@ def execute_search(ctx, target: str, token: str) -> base.ToolResult:
     matches = [r for r in records if isinstance(r, dict) and _matches(r, terms)]
     cap = setting.GMAIL_SEARCH_MAX_RESULTS
     truncated = bool(index.get("truncated")) or len(matches) > cap
+    kept = matches[:cap]
     document = {
-        "messages": matches[:cap],
-        "result_count": min(len(matches), cap),
+        "messages": kept,
+        "result_count": len(kept),
         "truncated": truncated,
         "synced_at": index.get("synced_at"),
     }
     text = json.dumps(document, ensure_ascii=False)
     if len(text) > setting.GMAIL_MAX_CHARS:
-        # Defense in depth — with capped records this should be unreachable.
-        text = text[: setting.GMAIL_MAX_CHARS]
+        # Defense in depth — unreachable with bounded header records, but
+        # NEVER hand the model malformed JSON: drop whole trailing records
+        # until the document fits, rather than slicing the serialized string
+        # mid-structure.
+        while kept and len(json.dumps({**document, "messages": kept, "result_count": len(kept)},
+                                      ensure_ascii=False)) > setting.GMAIL_MAX_CHARS:
+            kept = kept[:-1]
+        document["messages"] = kept
+        document["result_count"] = len(kept)
+        document["truncated"] = True
         truncated = True
+        text = json.dumps(document, ensure_ascii=False)
     return base.ToolResult(
         text=text,
         source="the user's Gmail inbox index",
@@ -503,7 +515,22 @@ def execute_get(ctx, target: str, token: str) -> base.ToolResult:
     }
     text = json.dumps(document, ensure_ascii=False)
     if len(text) > setting.GMAIL_MAX_CHARS:
-        text = text[: setting.GMAIL_MAX_CHARS]
+        # A ~64 KiB body (the connector's GMAIL_MAX_BODY_BYTES) can serialize
+        # past GMAIL_MAX_CHARS. Shrink body_text (the only unbounded field)
+        # so the document stays valid JSON — every removed body char frees at
+        # least one serialized char, so one pass is enough — instead of
+        # slicing the serialized string mid-structure.
+        body = document.get("body_text")
+        if isinstance(body, str):
+            overflow = len(text) - setting.GMAIL_MAX_CHARS
+            document["body_text"] = body[: max(0, len(body) - overflow)]
+            text = json.dumps(document, ensure_ascii=False)
+        if len(text) > setting.GMAIL_MAX_CHARS:
+            # body_text was not the culprit (headers alone over cap — only
+            # with a pathological config); emit an empty-body doc, never
+            # broken JSON.
+            document["body_text"] = ""
+            text = json.dumps(document, ensure_ascii=False)
         truncated = True
     return base.ToolResult(
         text=text,

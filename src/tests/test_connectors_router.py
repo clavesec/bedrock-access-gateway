@@ -134,7 +134,13 @@ def test_confirm_validates_and_relays_the_nonce(client, enabled, session):
         json={"nonce": "n" * 43},
     )
     assert response.status_code == 200
-    assert session.calls[0]["json"] == {"nonce": "n" * 43}
+    # The relayed body MUST carry the connector's required `schema` field —
+    # GmailConfirmRequest aliases it with no default, so a bare {nonce} is a
+    # 422 the gateway would map to 502 and break the whole confirm flow.
+    assert session.calls[0]["json"] == {
+        "schema": "tpai.connector.gmail-confirm.request.v1",
+        "nonce": "n" * 43,
+    }
 
     for bad in ["short", "bad nonce!" + "x" * 20]:
         response = client.post(
@@ -156,6 +162,32 @@ def test_connector_403_is_relayed_and_drops_the_dek_cache(client, enabled, sessi
     assert response.status_code == 403
     assert response.json()["reason"] == "not-connected"
     assert computed_identity not in gmail._dek_cache
+
+
+def test_successful_disconnect_drops_the_dek_cache(client, enabled, session):
+    # A disconnect (200) must invalidate the gmail_search DEK cache too, so
+    # the plaintext DEK cannot outlive an explicit disconnect by the cache
+    # TTL if the connector's index delete transiently fails (S15 R-5).
+    from tests.conftest import expected_hmac
+
+    identity = expected_hmac("owui-user-id", USER_ID)
+    gmail._dek_cache[identity] = (b"\x11" * 32, 2**31)
+    session.queue(FakeResponse(200, {"disconnected": True}))
+    response = client.post("/api/v1/connectors/gmail/disconnect", headers=IDENTITY_HEADERS)
+    assert response.status_code == 200
+    assert identity not in gmail._dek_cache
+
+
+def test_successful_status_does_not_drop_the_dek_cache(client, enabled, session):
+    # Only disconnect invalidates on success — a plain status read must not.
+    from tests.conftest import expected_hmac
+
+    identity = expected_hmac("owui-user-id", USER_ID)
+    gmail._dek_cache[identity] = (b"\x11" * 32, 2**31)
+    session.queue(FakeResponse(200, {"status": "connected"}))
+    client.get("/api/v1/connectors/gmail/status", headers=IDENTITY_HEADERS)
+    assert identity in gmail._dek_cache
+    gmail._dek_cache.pop(identity, None)
 
 
 def test_connector_401_triggers_exactly_one_remint(client, enabled, session):
