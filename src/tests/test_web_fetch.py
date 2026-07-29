@@ -90,6 +90,32 @@ def test_trailing_punctuation_trimmed_but_balanced_parens_kept():
     ]
 
 
+def test_schemeless_www_hosts_are_extracted_and_normalized_to_https():
+    """Humans paste "www.cnn.com" and mean a URL (2026-07-29 finding: the
+    tool was silently not offered). Normalization is https, never http."""
+    messages = [user("use the web-fetch tool to read www.cnn.com")]
+    assert web_fetch.extract_human_urls(messages) == ["https://www.cnn.com"]
+
+
+def test_schemeless_www_does_not_match_inside_larger_tokens():
+    messages = [
+        user("mail me at admin@www.example.com or see nowww.example.com and foo-www.example.com")
+    ]
+    assert web_fetch.extract_human_urls(messages) == []
+
+
+def test_schemeless_www_dedupes_against_explicit_scheme():
+    messages = [user("www.example.com/a and https://www.example.com/a")]
+    assert web_fetch.extract_human_urls(messages) == ["https://www.example.com/a"]
+
+
+def test_bare_hostnames_without_www_are_still_not_extracted():
+    """Only the www. idiom is recognized — 'example.com' stays prose (D3
+    strictness is intentionally preserved for everything else)."""
+    messages = [user("check example.com and cnn.com for details")]
+    assert web_fetch.extract_human_urls(messages) == []
+
+
 def test_deduplicates_and_caps_the_list():
     many = " ".join(f"https://example.com/{i}" for i in range(40))
     messages = [user("https://example.com/1 twice: https://example.com/1"), user(many)]

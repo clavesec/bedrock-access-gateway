@@ -80,7 +80,12 @@ CONNECT_TIMEOUT_S = 3
 # name against the presented cert instead of the URL hostname.
 CONNECTOR_TLS_SERVER_NAME = "external-content-connector.internal"
 
-_URL_RE = re.compile(r"https?://[^\s<>\"'`\\]+", re.IGNORECASE)
+# Scheme-less `www.` hosts are accepted alongside http(s):// — humans paste
+# "www.cnn.com" and read it as a URL, and D3's intent is "the human named a
+# destination", not "the human typed a scheme". The negative lookbehind
+# keeps `www.` from matching inside a larger token (foo@www.x, https://www.x
+# is consumed by the first alternative).
+_URL_RE = re.compile(r"(?:https?://|(?<![\w@.-])www\.)[^\s<>\"'`\\]+", re.IGNORECASE)
 # Punctuation that is almost always prose trailing the URL, not part of it.
 _TRAILING_PUNCT = ".,;:!?)]}"
 
@@ -276,6 +281,9 @@ def extract_human_urls(messages) -> list[str]:
         for text in texts:
             for match in _URL_RE.findall(text):
                 url = _trim_trailing_punctuation(match)
+                if url.lower().startswith("www."):
+                    # Normalize scheme-less hosts upward: https, never http.
+                    url = "https://" + url
                 # The scheme is part of the regex; keep the explicit guard so
                 # a regex edit can never silently widen the scheme set.
                 if not url.lower().startswith(("http://", "https://")):
