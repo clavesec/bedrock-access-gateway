@@ -185,7 +185,7 @@ gateway's).
 | `WEB_FETCH_MODELS_ALL` | `false` | Claude-only until true |
 | `WEB_FETCH_MAX_ITERATIONS` | `4` | fetch rounds per request |
 | `WEB_FETCH_TIMEOUT_S` | `8` | connector-side origin fetch timeout |
-| `WEB_FETCH_CONNECTOR_TIMEOUT_S` | `30` | gateway→connector read timeout |
+| `WEB_FETCH_CONNECTOR_TIMEOUT_S` | `35` | gateway→connector read timeout; must exceed connector origin fetch (8s) + quarantine pass (20s) |
 | `WEB_FETCH_MAX_BYTES` | `2 MiB` | connector-response byte cap |
 | `WEB_FETCH_MAX_CHARS` | `50000` | toolResult char cap |
 | `WEB_FETCH_ALLOWED_DOMAINS` | empty | empty = beta allow-all (R5); non-empty = gateway-side suffix allowlist on top of the connector policy |
@@ -193,6 +193,21 @@ gateway's).
 | `WEB_FETCH_PROMPT_CACHE` | `false` | on from Phase 2 (R9), Claude only |
 | `TPAI_CONNECTOR_URL` | empty | injected by CDK (S09); empty = fail closed |
 | `TPAI_CONNECTOR_CA_B64` | empty | b64 PEM/DER of the egress-local CA (TPAI#365); set = connector session pins exactly this CA + asserts the contract SAN; empty = default public-CA verify (fails the egress-local cert — closed) |
+
+## Connector failure details (502/504 body contract)
+
+The connector's non-200 responses carry a content-free failure slug in the
+JSON body (`{"detail": "origin-status-403"}` etc. — see the connector's
+`webfetch/service.py`). This body is now load-bearing: the gateway parses
+it (bounded read + sanitize, `base.failure_detail`) and maps **origin-side**
+slugs through a fixed table to honest model-facing messages —
+`origin-status-401/403` ("the site refused the request … likely blocks
+automated access"), `404/410`, `429`, other `origin-status-NNN`, and
+`dns-resolution-failed`. Internal control failures (`quarantine-failed`,
+`policy-config-error`, `audit-unavailable`, unknown slugs, or a malformed
+body) deliberately map to the generic "the fetch failed" — the gateway
+never narrates its own security machinery, and connector-supplied text
+never reaches the model (the slug only *keys* the fixed table).
 
 ## Logging (E3)
 

@@ -45,11 +45,18 @@ class ToolAuthError(RuntimeError):
 class ToolExecutionError(RuntimeError):
     """The call failed (transport/connector/config failure) — surfaced to
     the model as an error toolResult. ``outcome`` is the audit outcome
-    (``error`` or ``timeout``)."""
+    (``error`` or ``timeout``).
 
-    def __init__(self, message: str, outcome: str = "error"):
+    ``model_text`` optionally overrides the handler's generic
+    ``error_text(outcome)`` with a more specific model-facing message
+    (e.g. "the site refused the request (HTTP 403)"). It must come from a
+    FIXED gateway-side table keyed on a sanitized failure slug — never
+    echo connector- or origin-supplied text to the model."""
+
+    def __init__(self, message: str, outcome: str = "error", model_text: str | None = None):
         super().__init__(message)
         self.outcome = outcome
+        self.model_text = model_text
 
 
 @dataclass(frozen=True)
@@ -142,6 +149,28 @@ def denial_reason(response) -> str:
     except (ValueError, AttributeError, TypeError, requests.exceptions.RequestException):
         pass
     return "connector-denied"
+
+
+def failure_detail(response) -> str | None:
+    """The connector ``detail`` slug from a 502/504 body, defensively parsed.
+
+    Same bounded-read/sanitize posture as ``denial_reason``; returns None
+    for a missing, non-JSON, or empty detail — callers fall back to their
+    generic error text. The slug itself never reaches the model; it only
+    keys a fixed gateway-side message table."""
+    try:
+        body = b""
+        for chunk in response.iter_content(chunk_size=4096):
+            body += chunk
+            if len(body) >= 4096:
+                break
+        payload = json.loads(body[:4096])
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail:
+            return re.sub(r"[^A-Za-z0-9._-]", "", detail)[:64] or None
+    except (ValueError, AttributeError, TypeError, requests.exceptions.RequestException):
+        pass
+    return None
 
 
 def read_capped_json(response, *, max_bytes: int, timeout_s: int, error=ToolExecutionError) -> dict:

@@ -336,7 +336,13 @@ def run_server_tool(plan: ServerToolPlan, ctx: ServerToolContext, tool_name: str
             ctx, tool_name, target=target, decision="allow", reason=gateway_policy_reason,
             outcome=exc.outcome, bytes_returned=None, latency_ms=latency_ms(),
         )
-        return ToolOutcome(result_text=handler.error_text(exc.outcome), outcome=exc.outcome)
+        # model_text is a specific message from the tool's FIXED slug table
+        # (e.g. "the site refused the request (HTTP 403)"); absent, the
+        # handler's generic outcome text stands.
+        return ToolOutcome(
+            result_text=exc.model_text or handler.error_text(exc.outcome),
+            outcome=exc.outcome,
+        )
 
     fenced = base.fence_external_content(result.text, result.source)
     if result.truncated:
