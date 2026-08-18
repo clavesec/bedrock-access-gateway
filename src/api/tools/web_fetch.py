@@ -450,7 +450,16 @@ def execute_web_fetch(url: str, token: str) -> FetchResult:
             if response.status_code == 504:
                 raise WebFetchError("connector reported an origin timeout", outcome="timeout")
             if response.status_code != 200:
-                raise WebFetchError(f"connector returned status {response.status_code}")
+                # The 502 body carries a content-free failure slug
+                # (origin-status-<N>, dns-resolution-failed, ...). Map it to
+                # an honest fixed message so the model can tell the user a
+                # site refused the request instead of confabulating; internal
+                # control failures deliberately map to None (stay generic).
+                detail = base.failure_detail(response)
+                raise WebFetchError(
+                    f"connector returned status {response.status_code}",
+                    model_text=_model_text_for_detail(detail),
+                )
             payload = _read_capped_json(response)
     except requests.exceptions.Timeout as exc:
         raise WebFetchError("connector body read timed out", outcome="timeout") from exc
@@ -476,6 +485,48 @@ def execute_web_fetch(url: str, token: str) -> FetchResult:
 # Shared implementations in api.tools.base (kept under the original names —
 # the response-parsing tests exercise them through this module).
 _denial_reason = base.denial_reason
+
+
+_ORIGIN_STATUS_DETAIL = re.compile(r"^origin-status-(\d{3})$")
+
+
+def _model_text_for_detail(detail: str | None) -> str | None:
+    """Fixed slug→message table for connector failure details.
+
+    Only origin-side failures get a specific message — those are facts about
+    the external site the user can act on. Internal control failures
+    (quarantine-failed, policy-config-error, audit-unavailable, unknown
+    slugs) return None so the model sees the generic text: the gateway never
+    narrates its own security machinery to the conversation."""
+    if not detail:
+        return None
+    match = _ORIGIN_STATUS_DETAIL.match(detail)
+    if match:
+        status = int(match.group(1))
+        if status in (401, 403):
+            return (
+                f"web_fetch error: the site refused the request (HTTP {status}) — "
+                "it likely blocks automated access; the page may only be "
+                "viewable in a browser."
+            )
+        if status in (404, 410):
+            return f"web_fetch error: the page was not found (HTTP {status})."
+        if status == 429:
+            return "web_fetch error: the site rate-limited the request (HTTP 429)."
+        if status == 503:
+            # Live probe evidence (2026-08-18, numbeo): IP-reputation blocking
+            # presents as a fast 503 to datacenter sources — often not a real
+            # outage. Say both so the model doesn't misreport a block as
+            # downtime.
+            return (
+                "web_fetch error: the site returned HTTP 503 (unavailable) — "
+                "some sites answer automated requests this way; the page may "
+                "only be viewable in a browser."
+            )
+        return f"web_fetch error: the site returned an error (HTTP {status})."
+    if detail == "dns-resolution-failed":
+        return "web_fetch error: the hostname could not be resolved."
+    return None
 
 
 def _read_capped_json(response) -> dict:

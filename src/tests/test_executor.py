@@ -289,6 +289,27 @@ def test_fetch_timeout_is_audited_as_allow_timeout(recorder, plan):
     assert record["bytes_returned"] is None
 
 
+def test_fetch_error_model_text_overrides_generic_error_text(recorder, plan):
+    # A WebFetchError carrying model_text (from the fixed detail table)
+    # reaches the model verbatim; the audit record is unchanged.
+    recorder.fetch_exc = web_fetch.WebFetchError(
+        "connector returned status 502",
+        model_text="web_fetch error: the site refused the request (HTTP 403) — "
+        "it likely blocks automated access; the page may only be viewable in a browser.",
+    )
+    outcome = executor.run_server_tool(plan, CTX, "web_fetch", {"url_index": 0})
+    assert outcome.outcome == "error"
+    assert "HTTP 403" in outcome.result_text
+    assert recorder.records[0]["outcome"] == "error"
+
+
+def test_fetch_error_without_model_text_falls_back_to_generic(recorder, plan):
+    recorder.fetch_exc = web_fetch.WebFetchError("connector returned status 502")
+    outcome = executor.run_server_tool(plan, CTX, "web_fetch", {"url_index": 0})
+    assert outcome.outcome == "error"
+    assert outcome.result_text == "web_fetch error: the fetch failed."
+
+
 def test_unauditable_success_discards_the_fetched_content(recorder, plan):
     recorder.audit_exc = audit.AuditEmitError("sink down")
     outcome = executor.run_server_tool(plan, CTX, "web_fetch", {"url_index": 0})

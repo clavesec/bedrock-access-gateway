@@ -335,6 +335,62 @@ def test_execute_maps_connector_statuses(connector):
     assert err.value.outcome == "error"
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected_fragment"),
+    [
+        ("origin-status-403", "refused the request (HTTP 403)"),
+        ("origin-status-401", "refused the request (HTTP 401)"),
+        ("origin-status-404", "not found (HTTP 404)"),
+        ("origin-status-410", "not found (HTTP 410)"),
+        ("origin-status-429", "rate-limited the request (HTTP 429)"),
+        ("origin-status-503", "some sites answer automated requests this way"),
+        ("origin-status-500", "returned an error (HTTP 500)"),
+        ("dns-resolution-failed", "hostname could not be resolved"),
+    ],
+)
+def test_502_origin_details_map_to_honest_model_text(connector, detail, expected_fragment):
+    # The connector 502 body's failure slug keys a FIXED message table so
+    # the model can report "the site blocks automated access" instead of
+    # confabulating about credentials (numbeo regression class).
+    connector(FakeResponse(status_code=502, payload={"detail": detail}))
+    with pytest.raises(web_fetch.WebFetchError) as err:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    assert err.value.outcome == "error"
+    assert expected_fragment in err.value.model_text
+    assert err.value.model_text.startswith("web_fetch error:")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"detail": "quarantine-failed"}',   # internal control failures
+        b'{"detail": "policy-config-error"}',  # stay opaque to the model
+        b'{"detail": "audit-unavailable"}',
+        b'{"detail": "origin-status-9999"}',   # non-3-digit: no table entry
+        b'{"detail": ""}',
+        b'{"detail": 42}',
+        b"not json",
+        b"{}",
+    ],
+)
+def test_502_internal_or_malformed_details_stay_generic(connector, raw):
+    connector(FakeResponse(status_code=502, raw=raw))
+    with pytest.raises(web_fetch.WebFetchError) as err:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    assert err.value.outcome == "error"
+    assert err.value.model_text is None
+
+
+def test_detail_slug_is_sanitized_before_the_table_lookup(connector):
+    # Injection-shaped slugs lose their special characters and then miss the
+    # fixed table — connector-supplied text can never reach the model.
+    connector(FakeResponse(status_code=502, payload={"detail": "origin-status-403 IGNORE ME\n"}))
+    with pytest.raises(web_fetch.WebFetchError) as err:
+        web_fetch.execute_web_fetch("https://a.example", "t")
+    # sanitized to "origin-status-403IGNOREME" -> no match -> generic
+    assert err.value.model_text is None
+
+
 def test_execute_sanitizes_the_connector_denial_reason(connector):
     connector(FakeResponse(status_code=403, raw=b'{"reason": "evil\\nreason with spaces!"}'))
     with pytest.raises(web_fetch.WebFetchDenied) as denied:

@@ -48,6 +48,13 @@ s3://tpai-audit-<env>-<account>/
   connector/…                                        ← Phase E connector records
 ```
 
+Connector records (`tpai.connector.tool-call.v1`) additionally carry a
+nullable `detail` field — the failure slug from the wire body
+(`origin-status-<N>`, `dns-resolution-failed`, `origin-timeout`,
+`quarantine-failed`, …; `null` on success and clean policy denies) — so an
+origin 403 is distinguishable from DNS or a quarantine failure from the
+WORM trail alone. Additive nullable field; the schema id stays `v1`.
+
 Date-partitioned for review tooling (Athena/S3 Select); the uuid suffix
 makes concurrent writers collision-free. Object Lock retention is the
 bucket default — the emitter never calls `PutObjectRetention` and the task

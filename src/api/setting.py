@@ -48,7 +48,9 @@ WEB_FETCH_PROMPT_CACHE = os.environ.get("WEB_FETCH_PROMPT_CACHE", "false").lower
 # Read timeout (seconds) for the gateway->connector call. Must exceed the
 # connector's own origin-fetch timeout (WEB_FETCH_TIMEOUT_S, enforced
 # connector-side) plus its quarantined-model extraction pass (R7).
-WEB_FETCH_CONNECTOR_TIMEOUT_S = int(os.environ.get("WEB_FETCH_CONNECTOR_TIMEOUT_S", "30"))
+# Must exceed the connector's own worst case: origin fetch (8s) + quarantine
+# pass (20s) < 35 (docs/WebFetch.md budget contract).
+WEB_FETCH_CONNECTOR_TIMEOUT_S = int(os.environ.get("WEB_FETCH_CONNECTOR_TIMEOUT_S", "35"))
 # Base URL of the external-content connector's PrivateLink interface endpoint
 # (https://vpce-….vpce-svc-….…), injected by the bedrock-gateway-stack CDK
 # wiring since S09. Unset leaves the whole fetch path dark (fail closed).
