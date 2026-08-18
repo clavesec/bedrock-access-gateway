@@ -343,6 +343,7 @@ def test_execute_maps_connector_statuses(connector):
         ("origin-status-404", "not found (HTTP 404)"),
         ("origin-status-410", "not found (HTTP 410)"),
         ("origin-status-429", "rate-limited the request (HTTP 429)"),
+        ("origin-status-503", "some sites answer automated requests this way"),
         ("origin-status-500", "returned an error (HTTP 500)"),
         ("dns-resolution-failed", "hostname could not be resolved"),
     ],

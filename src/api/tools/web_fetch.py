@@ -513,6 +513,16 @@ def _model_text_for_detail(detail: str | None) -> str | None:
             return f"web_fetch error: the page was not found (HTTP {status})."
         if status == 429:
             return "web_fetch error: the site rate-limited the request (HTTP 429)."
+        if status == 503:
+            # Live probe evidence (2026-08-18, numbeo): IP-reputation blocking
+            # presents as a fast 503 to datacenter sources — often not a real
+            # outage. Say both so the model doesn't misreport a block as
+            # downtime.
+            return (
+                "web_fetch error: the site returned HTTP 503 (unavailable) — "
+                "some sites answer automated requests this way; the page may "
+                "only be viewable in a browser."
+            )
         return f"web_fetch error: the site returned an error (HTTP {status})."
     if detail == "dns-resolution-failed":
         return "web_fetch error: the hostname could not be resolved."
